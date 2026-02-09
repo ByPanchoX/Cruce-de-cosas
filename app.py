@@ -4,7 +4,7 @@ import io
 
 st.set_page_config(page_title="Consolidador Remuneraciones", layout="wide")
 
-# Estado de sesión para acumular empresas
+# Inicializar la lista de datos si no existe
 if 'datos_acumulados' not in st.session_state:
     st.session_state['datos_acumulados'] = []
 
@@ -14,7 +14,6 @@ def clean_rut(rut):
     return "".join(filter(lambda x: x.isdigit() or x == 'K', rut))
 
 def parse_informe_con_secciones(df):
-    """Extrae conceptos separando Haberes de Descuentos"""
     data = []
     current_section = 'HABERES'
     current_category = None
@@ -57,8 +56,6 @@ with st.sidebar:
         st.session_state['datos_acumulados'] = []
         st.rerun()
 
-st.info("Este programa extraerá los **Días** del Libro y los **Montos** del Informe de Haberes.")
-
 col1, col2 = st.columns(2)
 with col1:
     file_libro = st.file_uploader("1. Libro de Remuneraciones (.xlsx)", type=["xlsx"])
@@ -71,15 +68,13 @@ if file_libro and file_informe:
             df_libro_raw = pd.read_excel(file_libro)
             df_informe_raw = pd.read_excel(file_informe)
             
-            # --- FILTRO DE COLUMNAS (SOLO DÍAS) ---
+            # --- FILTRO DE DÍAS ---
             cols_id = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
-            # Filtramos cualquier columna que mencione 'Dia'
             cols_dias = [c for c in df_libro_raw.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
-            
             columnas_finales_libro = [c for c in (cols_id + cols_dias) if c in df_libro_raw.columns]
             df_libro_solo_dias = df_libro_raw[columnas_finales_libro].copy()
             
-            # --- PROCESAR INFORME (HABERES Y DESCUENTOS) ---
+            # --- PROCESAR INFORME ---
             df_parsed = parse_informe_con_secciones(df_informe_raw)
             hab_list = df_parsed[df_parsed['Seccion'] == 'HABERES']['Concepto'].unique().tolist()
             des_list = df_parsed[df_parsed['Seccion'] == 'DESCUENTOS']['Concepto'].unique().tolist()
@@ -87,21 +82,24 @@ if file_libro and file_informe:
             df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
             
             # --- UNIÓN ---
-            df_libro_solo_dias['rut_key'] = df_libro_solo_dias['Rut Trabajador'].apply(clean_rut)
+            # Identificar columna RUT en el libro
+            col_rut_libro = [c for c in df_libro_solo_dias.columns if 'Rut' in str(c)][0]
+            df_libro_solo_dias['rut_key'] = df_libro_solo_dias[col_rut_libro].apply(clean_rut)
+            
             df_merged = pd.merge(df_libro_solo_dias, df_pivot, left_on='rut_key', right_on='Rut', how='left').drop(columns=['rut_key', 'Rut'])
             
-            # Identificación de empresa y fecha
+            # Insertar metadatos
             df_merged.insert(0, 'Año', anio_sel)
             df_merged.insert(0, 'Mes', mes_sel)
             df_merged.insert(0, 'Empresa', empresa_final)
             
+            # GUARDAR COMO DICCIONARIO
             st.session_state['datos_acumulados'].append({
                 'df': df_merged,
                 'haberes': hab_list,
-                'descuentos': des_list,
-                'dias': cols_dias
+                'descuentos': des_list
             })
-            st.success(f"¡{empresa_final} ({mes_sel}) lista para consolidar!")
+            st.success(f"✅ Agregado: {empresa_final} ({mes_sel})")
             
         except Exception as e:
             st.error(f"Error al procesar: {e}")
@@ -109,41 +107,39 @@ if file_libro and file_informe:
 # --- BOTÓN FINAL DE DESCARGA ---
 if st.session_state['datos_acumulados']:
     st.divider()
-    if st.button("🚀 GENERAR EXCEL FINAL (CONSOLIDADO TOTAL)"):
-        # Unimos todas las empresas/meses cargados
-        df_total = pd.concat([item['df'] for item in st.session_state['datos_acumulados']], ignore_index=True)
+    st.subheader("Empresas listas para descargar:")
+    resumen = [{"Empresa": i['df']['Empresa'].iloc[0], "Mes": i['df']['Mes'].iloc[0]} for i in st.session_state['datos_acumulados']]
+    st.table(resumen)
+
+    if st.button("🚀 GENERAR EXCEL FINAL CONSOLIDADO"):
+        # Extraer solo los DataFrames de la lista de diccionarios
+        lista_solo_dfs = [item['df'] for item in st.session_state['datos_acumulados']]
+        df_total = pd.concat(lista_solo_dfs, ignore_index=True)
         
-        # Recolectamos todas las columnas de haberes y descuentos para ordenar
-        hab_total = []
-        des_total = []
-        for item in st.session_state['datos_acumulados']:
-            hab_total.extend(item['haberes'])
-            des_total.extend(item['descuentos'])
-        
-        # Definimos el orden de las columnas: ID -> Días -> Haberes -> Descuentos
+        # Ordenar columnas
         ids = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
         dias = [c for c in df_total.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
-        habs = [c for c in sorted(list(set(hab_total))) if c in df_total.columns and c not in ids]
-        dess = [c for c in sorted(list(set(des_total))) if c in df_total.columns and c not in ids]
         
-        resto = [c for c in df_total.columns if c not in (ids + dias + habs + dess)]
+        # Recolectar nombres de haberes y descuentos
+        h_cols = []
+        d_cols = []
+        for item in st.session_state['datos_acumulados']:
+            h_cols.extend(item['haberes'])
+            d_cols.extend(item['descuentos'])
         
-        # Eliminar duplicados de la lista de orden
+        h_final = [c for c in sorted(list(set(h_cols))) if c in df_total.columns and c not in ids]
+        d_final = [c for c in sorted(list(set(d_cols))) if c in df_total.columns and c not in ids]
+        
+        resto = [c for c in df_total.columns if c not in (ids + dias + h_final + d_final)]
+        
         orden_final = []
-        for c in (ids + dias + habs + dess + resto):
+        for c in (ids + dias + h_final + d_final + resto):
             if c not in orden_final: orden_final.append(c)
-        
+            
         df_total = df_total[orden_final]
         
-        # Exportar
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_total.to_excel(writer, index=False, sheet_name='Consolidado_Final')
+            df_total.to_excel(writer, index=False, sheet_name='Consolidado')
         
-        st.download_button(
-            label="📥 Descargar Excel con Todo",
-            data=output.getvalue(),
-            file_name="Remuneraciones_INGEMARS_ENAP_Final.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        st.dataframe(df_total.head(20))
+        st.download_button(label="📥 Descargar Excel Final", data=output.getvalue(), file_name="Consolidado_Final.xlsx")
