@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import io
 
-st.set_page_config(page_title="Consolidador Remuneraciones - Solo Días", layout="wide")
+st.set_page_config(page_title="Consolidador Remuneraciones", layout="wide")
 
-# Inicializar estado de la sesión
+# Estado de sesión para acumular empresas
 if 'datos_acumulados' not in st.session_state:
     st.session_state['datos_acumulados'] = []
 
@@ -14,6 +14,7 @@ def clean_rut(rut):
     return "".join(filter(lambda x: x.isdigit() or x == 'K', rut))
 
 def parse_informe_con_secciones(df):
+    """Extrae conceptos separando Haberes de Descuentos"""
     data = []
     current_section = 'HABERES'
     current_category = None
@@ -41,21 +42,22 @@ def parse_informe_con_secciones(df):
     return pd.DataFrame(data)
 
 # --- INTERFAZ ---
-st.title("📊 Consolidador: Identificación + Días + Desglose Detallado")
+st.title("📊 Consolidador: Identificación + Días + Desglose")
 
 with st.sidebar:
-    st.header("1. Configuración")
-    opcion_empresa = st.selectbox("Empresa", ["INGEMARS", "ENAP", "Otra..."])
-    empresa_nombre = st.text_input("Nombre de la Empresa") if opcion_empresa == "Otra..." else opcion_empresa
+    st.header("Configuración")
+    empresa_opcion = st.selectbox("Empresa", ["INGEMARS", "ENAP", "Otra..."])
+    empresa_final = st.text_input("Nombre Personalizado") if empresa_opcion == "Otra..." else empresa_opcion
     
     mes_sel = st.selectbox("Mes", ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"])
     anio_sel = st.number_input("Año", 2025)
     
-    if st.button("🗑️ Limpiar Todo"):
+    st.divider()
+    if st.button("🗑️ Reiniciar Todo"):
         st.session_state['datos_acumulados'] = []
         st.rerun()
 
-st.info("💡 Este programa filtrará el Libro de Remuneraciones para dejar solo las columnas de Días y lo cruzará con el Informe detallado.")
+st.info("Este programa extraerá los **Días** del Libro y los **Montos** del Informe de Haberes.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -64,80 +66,84 @@ with col2:
     file_informe = st.file_uploader("2. Informe Haberes y Descuentos (.xlsx)", type=["xlsx"])
 
 if file_libro and file_informe:
-    if st.button(f"➕ Procesar {empresa_nombre}"):
+    if st.button(f"➕ Agregar {empresa_final} a la lista"):
         try:
             df_libro_raw = pd.read_excel(file_libro)
             df_informe_raw = pd.read_excel(file_informe)
             
-            # --- FILTRAR LIBRO PARA DEJAR SOLO IDENTIFICACIÓN Y DÍAS ---
-            cols_identificacion = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
-            # Buscamos columnas que tengan la palabra "Dia" o "Día"
+            # --- FILTRO DE COLUMNAS (SOLO DÍAS) ---
+            cols_id = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
+            # Filtramos cualquier columna que mencione 'Dia'
             cols_dias = [c for c in df_libro_raw.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
             
-            # Mantener solo las columnas deseadas del libro
-            columnas_a_mantener = [c for c in (cols_identificacion + cols_dias) if c in df_libro_raw.columns]
-            df_libro_filtrado = df_libro_raw[columnas_a_mantener].copy()
+            columnas_finales_libro = [c for c in (cols_id + cols_dias) if c in df_libro_raw.columns]
+            df_libro_solo_dias = df_libro_raw[columnas_finales_libro].copy()
             
-            # --- PROCESAR INFORME DETALLADO ---
+            # --- PROCESAR INFORME (HABERES Y DESCUENTOS) ---
             df_parsed = parse_informe_con_secciones(df_informe_raw)
-            haberes_list = df_parsed[df_parsed['Seccion'] == 'HABERES']['Concepto'].unique().tolist()
-            descuentos_list = df_parsed[df_parsed['Seccion'] == 'DESCUENTOS']['Concepto'].unique().tolist()
+            hab_list = df_parsed[df_parsed['Seccion'] == 'HABERES']['Concepto'].unique().tolist()
+            des_list = df_parsed[df_parsed['Seccion'] == 'DESCUENTOS']['Concepto'].unique().tolist()
             
             df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
             
-            # --- CRUZAR DATOS ---
-            df_libro_filtrado['rut_join'] = df_libro_filtrado['Rut Trabajador'].apply(clean_rut)
-            df_final = pd.merge(df_libro_filtrado, df_pivot, left_on='rut_join', right_on='Rut', how='left').drop(columns=['rut_join', 'Rut'])
+            # --- UNIÓN ---
+            df_libro_solo_dias['rut_key'] = df_libro_solo_dias['Rut Trabajador'].apply(clean_rut)
+            df_merged = pd.merge(df_libro_solo_dias, df_pivot, left_on='rut_key', right_on='Rut', how='left').drop(columns=['rut_key', 'Rut'])
             
-            # Agregar metadatos
-            df_final.insert(0, 'Año', anio_sel)
-            df_final.insert(0, 'Mes', mes_sel)
-            df_final.insert(0, 'Empresa', empresa_nombre)
+            # Identificación de empresa y fecha
+            df_merged.insert(0, 'Año', anio_sel)
+            df_merged.insert(0, 'Mes', mes_sel)
+            df_merged.insert(0, 'Empresa', empresa_final)
             
-            # Guardar en sesión
             st.session_state['datos_acumulados'].append({
-                'df': df_final,
-                'haberes': haberes_list,
-                'descuentos': descuentos_list
+                'df': df_merged,
+                'haberes': hab_list,
+                'descuentos': des_list,
+                'dias': cols_dias
             })
-            st.success(f"Agregado: {empresa_nombre} ({mes_sel})")
+            st.success(f"¡{empresa_final} ({mes_sel}) lista para consolidar!")
             
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Error al procesar: {e}")
 
-# --- DESCARGA FINAL ---
+# --- BOTÓN FINAL DE DESCARGA ---
 if st.session_state['datos_acumulados']:
     st.divider()
-    if st.button("🚀 GENERAR EXCEL FINAL CONSOLIDADO"):
-        lista_dfs = [item['df'] for item in st.session_state['datos_acumulados']]
-        df_total = pd.concat(lista_dfs, ignore_index=True)
+    if st.button("🚀 GENERAR EXCEL FINAL (CONSOLIDADO TOTAL)"):
+        # Unimos todas las empresas/meses cargados
+        df_total = pd.concat([item['df'] for item in st.session_state['datos_acumulados']], ignore_index=True)
         
-        # Identificar todas las columnas de haberes y descuentos para el orden
-        todos_haberes = []
-        todos_descuentos = []
+        # Recolectamos todas las columnas de haberes y descuentos para ordenar
+        hab_total = []
+        des_total = []
         for item in st.session_state['datos_acumulados']:
-            todos_haberes.extend(item['haberes'])
-            todos_descuentos.extend(item['descuentos'])
+            hab_total.extend(item['haberes'])
+            des_total.extend(item['descuentos'])
         
-        # Ordenar columnas: ID -> Días -> Haberes -> Descuentos -> Resto
-        cols_base = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
-        cols_dias = [c for c in df_total.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
+        # Definimos el orden de las columnas: ID -> Días -> Haberes -> Descuentos
+        ids = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
+        dias = [c for c in df_total.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
+        habs = [c for c in sorted(list(set(hab_total))) if c in df_total.columns and c not in ids]
+        dess = [c for c in sorted(list(set(des_total))) if c in df_total.columns and c not in ids]
         
-        # Limpiar listas de haberes/descuentos de duplicados y asegurar que existan en el df final
-        hab_final = [c for c in sorted(list(set(todos_haberes))) if c in df_total.columns and c not in cols_base]
-        des_final = [c for c in sorted(list(set(todos_descuentos))) if c in df_total.columns and c not in cols_base]
+        resto = [c for c in df_total.columns if c not in (ids + dias + habs + dess)]
         
-        otros = [c for c in df_total.columns if c not in cols_base and c not in cols_dias and c not in hab_final and c not in des_final]
-        
+        # Eliminar duplicados de la lista de orden
         orden_final = []
-        for c in (cols_base + cols_dias + hab_final + des_final + otros):
+        for c in (ids + dias + habs + dess + resto):
             if c not in orden_final: orden_final.append(c)
-            
+        
         df_total = df_total[orden_final]
         
+        # Exportar
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_total.to_excel(writer, index=False, sheet_name='Consolidado')
+            df_total.to_excel(writer, index=False, sheet_name='Consolidado_Final')
         
-        st.download_button(label="📥 Descargar Excel Final", data=output.getvalue(), file_name="Consolidado_Remuneraciones.xlsx")
-        st.dataframe(df_total)
+        st.download_button(
+            label="📥 Descargar Excel con Todo",
+            data=output.getvalue(),
+            file_name="Remuneraciones_INGEMARS_ENAP_Final.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.dataframe(df_total.head(20))
