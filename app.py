@@ -9,18 +9,6 @@ st.set_page_config(page_title="Consolidador Remuneraciones Pro", layout="wide")
 if 'datos_acumulados' not in st.session_state:
     st.session_state['datos_acumulados'] = []
 
-def normalizar_extremo(texto):
-    """Limpia tildes, espacios, mayúsculas, signos y la 's' final para comparar conceptos."""
-    if pd.isna(texto): return ""
-    texto = str(texto).lower().strip()
-    # Quitar tildes
-    texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
-    # Quitar todo lo que no sea letras o números
-    texto = re.sub(r'[^a-z0-9]', '', texto)
-    # Quitar la 's' final para tratar plurales y singulares como igual (ej: dias/dia)
-    if texto.endswith('s'): texto = texto[:-1]
-    return texto
-
 def clean_rut(rut):
     if pd.isna(rut): return None
     rut = str(rut).upper()
@@ -34,7 +22,6 @@ def parse_informe_con_secciones(df):
     for i in range(len(df)):
         row = df.iloc[i]
         val_0 = str(row.iloc[0]) if pd.notna(row.iloc[0]) else None
-        
         if val_0 == 'HABERES': current_section = 'HABERES'
         elif val_0 == 'DESCUENTOS': current_section = 'DESCUENTOS'
             
@@ -54,13 +41,12 @@ def parse_informe_con_secciones(df):
     return pd.DataFrame(data)
 
 # --- INTERFAZ ---
-st.title("📊 Consolidador: Identificación + Días + Desglose")
+st.title("📊 Consolidador de Remuneraciones (Versión Limpia)")
 
 with st.sidebar:
     st.header("Configuración")
     empresa_opcion = st.selectbox("Empresa", ["INGEMARS", "ENAP", "Otra..."])
     empresa_final = st.text_input("Nombre Personalizado") if empresa_opcion == "Otra..." else empresa_opcion
-    
     mes_sel = st.selectbox("Mes", ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"])
     anio_sel = st.number_input("Año", 2025)
     
@@ -76,52 +62,30 @@ with col2:
     file_informe = st.file_uploader("2. Informe Haberes y Descuentos (.xlsx)", type=["xlsx"])
 
 if file_libro and file_informe:
-    if st.button(f"➕ Agregar {empresa_final} a la lista"):
+    if st.button(f"➕ Agregar {empresa_final}"):
         try:
             df_libro_raw = pd.read_excel(file_libro)
             df_informe_raw = pd.read_excel(file_informe)
             
-            # 1. FILTRAR LIBRO (SOLO IDENTIFICACIÓN Y DÍAS)
+            # --- FILTRO ESTRICTO DE DÍAS (SOLO CONTEOS N°) ---
             cols_id = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
-            cols_dias = [c for c in df_libro_raw.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
+            # Solo traemos columnas que empiecen con N° (que son los días contados)
+            cols_conteo = [c for c in df_libro_raw.columns if str(c).startswith('N°')]
             
-            # Guardamos los nombres originales pero mapeados por su versión normalizada
-            mapa_libro_norm = {normalizar_extremo(c): c for c in (cols_id + cols_dias) if c in df_libro_raw.columns}
-            df_libro_final = df_libro_raw[list(mapa_libro_norm.values())].copy()
+            df_libro_final = df_libro_raw[cols_id + cols_conteo].copy()
             
-            # 2. PROCESAR INFORME
+            # --- PROCESAR INFORME (DINERO) ---
             df_parsed = parse_informe_con_secciones(df_informe_raw)
             df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
             
-            # 3. DEDUPLICACIÓN INTELIGENTE
-            nuevos_haberes = []
-            nuevos_descuentos = []
-            columnas_rename = {}
+            hab_list = df_parsed[df_parsed['Seccion'] == 'HABERES']['Concepto'].unique().tolist()
+            des_list = df_parsed[df_parsed['Seccion'] == 'DESCUENTOS']['Concepto'].unique().tolist()
 
-            for col in df_pivot.columns:
-                if col == 'Rut': continue
-                
-                norm_col = normalizar_extremo(col)
-                seccion = df_parsed[df_parsed['Concepto'] == col]['Seccion'].iloc[0]
-                
-                # Si el concepto del informe ya existe en el libro (ej: Días Ausentes vs Dias Ausentes)
-                if norm_col in mapa_libro_norm:
-                    nuevo_nombre = f"{col} (Monto)"
-                else:
-                    nuevo_nombre = col
-                
-                columnas_rename[col] = nuevo_nombre
-                if seccion == 'HABERES': nuevos_haberes.append(nuevo_nombre)
-                else: nuevos_descuentos.append(nuevo_nombre)
-
-            df_pivot = df_pivot.rename(columns=columnas_rename)
-
-            # 4. UNIÓN FINAL
+            # --- UNIÓN ---
             col_rut_libro = [c for c in df_libro_final.columns if 'Rut' in str(c)][0]
             df_libro_final['rut_key'] = df_libro_final[col_rut_libro].apply(clean_rut)
             
-            df_merged = pd.merge(df_libro_final, df_pivot, left_on='rut_key', right_on='Rut', how='left')
-            df_merged = df_merged.drop(columns=['rut_key', 'Rut'])
+            df_merged = pd.merge(df_libro_final, df_pivot, left_on='rut_key', right_on='Rut', how='left').drop(columns=['rut_key', 'Rut'])
             
             # Metadatos
             df_merged.insert(0, 'Año', anio_sel)
@@ -130,41 +94,36 @@ if file_libro and file_informe:
             
             st.session_state['datos_acumulados'].append({
                 'df': df_merged,
-                'haberes': nuevos_haberes,
-                'descuentos': nuevos_descuentos
+                'haberes': hab_list,
+                'descuentos': des_list
             })
             st.success(f"✅ {empresa_final} agregada sin duplicados.")
             
         except Exception as e:
             st.error(f"Error: {e}")
 
-# --- BOTÓN DE DESCARGA ---
+# --- DESCARGA FINAL ---
 if st.session_state['datos_acumulados']:
     st.divider()
     if st.button("🚀 GENERAR EXCEL FINAL"):
         df_total = pd.concat([item['df'] for item in st.session_state['datos_acumulados']], ignore_index=True)
         
-        # Re-ordenar columnas para que se vea impecable
+        # Orden de columnas: ID -> Conteos (N°) -> Haberes -> Descuentos
         ids = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
-        dias = [c for c in df_total.columns if ('dia' in str(c).lower() or 'día' in str(c).lower()) and c not in ids]
+        conteos = [c for c in df_total.columns if str(c).startswith('N°')]
         
-        h_all = []
-        d_all = []
+        h_all, d_all = [], []
         for item in st.session_state['datos_acumulados']:
-            h_all.extend(item['haberes'])
-            d_all.extend(item['descuentos'])
+            h_all.extend(item['haberes']); d_all.extend(item['descuentos'])
         
         h_f = [c for c in sorted(list(set(h_all))) if c in df_total.columns and c not in ids]
         d_f = [c for c in sorted(list(set(d_all))) if c in df_total.columns and c not in ids]
         
-        # Columnas finales ordenadas
         orden = []
-        for c in (ids + dias + h_f + d_f):
+        for c in (ids + conteos + h_f + d_f):
             if c in df_total.columns and c not in orden: orden.append(c)
         
-        # Añadir cualquier otra columna que haya quedado fuera
-        resto = [c for c in df_total.columns if c not in orden]
-        df_total = df_total[orden + resto]
+        df_total = df_total[orden + [c for c in df_total.columns if c not in orden]]
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -172,4 +131,4 @@ if st.session_state['datos_acumulados']:
         
         nombre_xls = f"Consolidado_{mes_sel}_{anio_sel}.xlsx"
         st.download_button(label=f"📥 Descargar {nombre_xls}", data=output.getvalue(), file_name=nombre_xls)
-        st.dataframe(df_total.head(15))
+        st.dataframe(df_total.head(10))
