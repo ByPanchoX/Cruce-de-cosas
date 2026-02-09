@@ -4,19 +4,21 @@ import io
 import unicodedata
 import re
 
-st.set_page_config(page_title="Consolidador Remuneraciones", layout="wide")
+st.set_page_config(page_title="Consolidador Remuneraciones Pro", layout="wide")
 
 if 'datos_acumulados' not in st.session_state:
     st.session_state['datos_acumulados'] = []
 
-def normalizar_texto(texto):
-    """Limpia tildes, espacios y mayúsculas para comparar nombres de columnas"""
+def normalizar_extremo(texto):
+    """Limpia tildes, espacios, mayúsculas, signos y la 's' final para comparar conceptos."""
     if pd.isna(texto): return ""
     texto = str(texto).lower().strip()
     # Quitar tildes
     texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
     # Quitar todo lo que no sea letras o números
     texto = re.sub(r'[^a-z0-9]', '', texto)
+    # Quitar la 's' final para tratar plurales y singulares como igual (ej: dias/dia)
+    if texto.endswith('s'): texto = texto[:-1]
     return texto
 
 def clean_rut(rut):
@@ -79,48 +81,46 @@ if file_libro and file_informe:
             df_libro_raw = pd.read_excel(file_libro)
             df_informe_raw = pd.read_excel(file_informe)
             
-            # --- FILTRO DE DÍAS ---
+            # 1. FILTRAR LIBRO (SOLO IDENTIFICACIÓN Y DÍAS)
             cols_id = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
             cols_dias = [c for c in df_libro_raw.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
             
-            # Creamos un mapa de nombres normalizados del Libro
-            nombres_libro_norm = {normalizar_texto(c): c for c in (cols_id + cols_dias) if c in df_libro_raw.columns}
-            df_libro_solo_dias = df_libro_raw[list(nombres_libro_norm.values())].copy()
+            # Guardamos los nombres originales pero mapeados por su versión normalizada
+            mapa_libro_norm = {normalizar_extremo(c): c for c in (cols_id + cols_dias) if c in df_libro_raw.columns}
+            df_libro_final = df_libro_raw[list(mapa_libro_norm.values())].copy()
             
-            # --- PROCESAR INFORME ---
+            # 2. PROCESAR INFORME
             df_parsed = parse_informe_con_secciones(df_informe_raw)
-            
-            # Pivotar el informe
             df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
             
-            # EVITAR DUPLICADOS POR NORMALIZACIÓN
+            # 3. DEDUPLICACIÓN INTELIGENTE
             nuevos_haberes = []
             nuevos_descuentos = []
-            
-            columnas_pivot_final = {'Rut': 'Rut'}
+            columnas_rename = {}
+
             for col in df_pivot.columns:
                 if col == 'Rut': continue
                 
-                norm_col = normalizar_texto(col)
+                norm_col = normalizar_extremo(col)
                 seccion = df_parsed[df_parsed['Concepto'] == col]['Seccion'].iloc[0]
                 
-                # Si el nombre normalizado ya existe en el Libro (ej: "diasausentes")
-                if norm_col in nombres_libro_norm:
+                # Si el concepto del informe ya existe en el libro (ej: Días Ausentes vs Dias Ausentes)
+                if norm_col in mapa_libro_norm:
                     nuevo_nombre = f"{col} (Monto)"
                 else:
                     nuevo_nombre = col
                 
-                columnas_pivot_final[col] = nuevo_nombre
+                columnas_rename[col] = nuevo_nombre
                 if seccion == 'HABERES': nuevos_haberes.append(nuevo_nombre)
                 else: nuevos_descuentos.append(nuevo_nombre)
 
-            df_pivot = df_pivot.rename(columns=columnas_pivot_final)
+            df_pivot = df_pivot.rename(columns=columnas_rename)
 
-            # --- UNIÓN ---
-            col_rut_libro = [c for c in df_libro_solo_dias.columns if 'Rut' in str(c)][0]
-            df_libro_solo_dias['rut_key'] = df_libro_solo_dias[col_rut_libro].apply(clean_rut)
+            # 4. UNIÓN FINAL
+            col_rut_libro = [c for c in df_libro_final.columns if 'Rut' in str(c)][0]
+            df_libro_final['rut_key'] = df_libro_final[col_rut_libro].apply(clean_rut)
             
-            df_merged = pd.merge(df_libro_solo_dias, df_pivot, left_on='rut_key', right_on='Rut', how='left')
+            df_merged = pd.merge(df_libro_final, df_pivot, left_on='rut_key', right_on='Rut', how='left')
             df_merged = df_merged.drop(columns=['rut_key', 'Rut'])
             
             # Metadatos
@@ -133,18 +133,18 @@ if file_libro and file_informe:
                 'haberes': nuevos_haberes,
                 'descuentos': nuevos_descuentos
             })
-            st.success(f"✅ {empresa_final} agregada correctamente.")
+            st.success(f"✅ {empresa_final} agregada sin duplicados.")
             
         except Exception as e:
             st.error(f"Error: {e}")
 
-# --- DESCARGA ---
+# --- BOTÓN DE DESCARGA ---
 if st.session_state['datos_acumulados']:
     st.divider()
     if st.button("🚀 GENERAR EXCEL FINAL"):
         df_total = pd.concat([item['df'] for item in st.session_state['datos_acumulados']], ignore_index=True)
         
-        # Orden de columnas
+        # Re-ordenar columnas para que se vea impecable
         ids = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
         dias = [c for c in df_total.columns if ('dia' in str(c).lower() or 'día' in str(c).lower()) and c not in ids]
         
@@ -157,11 +157,14 @@ if st.session_state['datos_acumulados']:
         h_f = [c for c in sorted(list(set(h_all))) if c in df_total.columns and c not in ids]
         d_f = [c for c in sorted(list(set(d_all))) if c in df_total.columns and c not in ids]
         
+        # Columnas finales ordenadas
         orden = []
         for c in (ids + dias + h_f + d_f):
             if c in df_total.columns and c not in orden: orden.append(c)
         
-        df_total = df_total[orden + [c for c in df_total.columns if c not in orden]]
+        # Añadir cualquier otra columna que haya quedado fuera
+        resto = [c for c in df_total.columns if c not in orden]
+        df_total = df_total[orden + resto]
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -169,4 +172,4 @@ if st.session_state['datos_acumulados']:
         
         nombre_xls = f"Consolidado_{mes_sel}_{anio_sel}.xlsx"
         st.download_button(label=f"📥 Descargar {nombre_xls}", data=output.getvalue(), file_name=nombre_xls)
-        st.dataframe(df_total.head(10))
+        st.dataframe(df_total.head(15))
