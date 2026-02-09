@@ -118,9 +118,9 @@ def procesar_libro_remuneraciones(df):
     """Procesa el Libro de Remuneraciones extrayendo datos básicos y días"""
     df_procesado = pd.DataFrame()
     
-    # Extraer datos personales
+    # Extraer datos personales - buscar con variaciones
     columnas_personales = {
-        'RUT': 'RUT Trabajador',
+        'Rut Trabajador': 'RUT Trabajador',
         'Apellido Paterno': 'Apellido Paterno',
         'Apellido Materno': 'Apellido Materno',
         'Nombres': 'Nombres'
@@ -130,7 +130,7 @@ def procesar_libro_remuneraciones(df):
         if col_original in df.columns:
             df_procesado[col_nueva] = df[col_original]
         else:
-            # Buscar variaciones del nombre de columna
+            # Buscar variaciones del nombre de columna (case insensitive)
             cols_encontradas = [c for c in df.columns if col_original.lower() in c.lower()]
             if cols_encontradas:
                 df_procesado[col_nueva] = df[cols_encontradas[0]]
@@ -145,16 +145,17 @@ def procesar_libro_remuneraciones(df):
     for col in columnas_dias:
         df_procesado[col] = df[col]
     
-    # Extraer Total Imponible
-    if 'Total Imponible' in df.columns:
-        df_procesado['Total Imponible (H)'] = pd.to_numeric(df['Total Imponible'], errors='coerce').fillna(0)
+    # Extraer Total Imponible - buscar varias opciones
+    columna_imponible = None
+    for opcion in ['Imponible', 'Total Imponible', 'Sueldo Imponible', 'Base Imponible']:
+        if opcion in df.columns:
+            columna_imponible = opcion
+            break
+    
+    if columna_imponible:
+        df_procesado['Total Imponible (H)'] = pd.to_numeric(df[columna_imponible], errors='coerce').fillna(0)
     else:
-        # Buscar variaciones
-        cols_imponible = [c for c in df.columns if 'imponible' in c.lower() and 'total' in c.lower()]
-        if cols_imponible:
-            df_procesado['Total Imponible (H)'] = pd.to_numeric(df[cols_imponible[0]], errors='coerce').fillna(0)
-        else:
-            df_procesado['Total Imponible (H)'] = 0
+        df_procesado['Total Imponible (H)'] = 0
     
     # Extraer Seguro de Cesantía (descuento del trabajador)
     if 'Seguro de Cesantía' in df.columns:
@@ -168,53 +169,81 @@ def procesar_libro_remuneraciones(df):
     
     return df_procesado
 
-def procesar_informe_haberes_descuentos(df):
-    """Procesa el Informe de Haberes y Descuentos etiquetando correctamente"""
-    df_procesado = pd.DataFrame()
+def procesar_informe_haberes_descuentos(df_original):
+    """
+    Procesa el Informe de Haberes y Descuentos con formato especial
+    El archivo tiene estructura: secciones de conceptos seguidas de trabajadores
+    """
+    # Leer el archivo sin encabezado para procesarlo manualmente
+    df = df_original.copy()
     
-    # Buscar columna de RUT
-    columna_rut = None
-    for col in df.columns:
-        if 'rut' in col.lower():
-            columna_rut = col
-            break
+    # Diccionario para almacenar datos por RUT
+    datos_por_rut = {}
     
-    if columna_rut:
-        df_procesado['RUT Trabajador'] = df[columna_rut].apply(limpiar_rut)
+    # Variables de control
+    concepto_actual = None
+    es_haber = True  # Empieza con haberes
     
-    # Procesar haberes y descuentos
-    procesando_haberes = True
-    
-    for col in df.columns:
-        col_lower = col.lower()
+    # Procesar fila por fila
+    for idx, row in df.iterrows():
+        row_values = row.values
         
-        # Saltar columna de RUT
-        if col == columna_rut:
+        # Detectar cambio a DESCUENTOS
+        primera_col = str(row_values[0]).strip().upper() if pd.notna(row_values[0]) else ""
+        if 'DESCUENTO' in primera_col:
+            es_haber = False
             continue
         
-        # Detectar inicio de sección de descuentos
-        if 'descuento' in col_lower or col_lower.strip() == 'descuentos':
-            procesando_haberes = False
-            continue
+        # Detectar nuevo concepto (fila con nombre en primera columna)
+        if pd.notna(row_values[0]) and row_values[0] != '' and str(row_values[0]).strip() != '':
+            # Es un concepto si no es un RUT
+            texto = str(row_values[0]).strip()
+            if not any(char.isdigit() for char in texto[:3]):  # No empieza con números
+                concepto_actual = texto
+                continue
         
-        # Saltar columnas vacías o de título
-        if df[col].isna().all() or col.strip() == '':
-            continue
+        # Detectar fila de trabajador (tiene RUT en columna 2)
+        rut_col = row_values[2] if len(row_values) > 2 else None
+        monto_col = row_values[10] if len(row_values) > 10 else None
         
-        # Limpiar nombre de columna
-        nombre_limpio = col.replace('(Monto)', '').strip()
-        
-        # Determinar si es haber o descuento
-        if procesando_haberes:
-            nombre_final = f"{nombre_limpio} (H)"
-        else:
-            nombre_final = f"{nombre_limpio} (D)"
-        
-        # Solo agregar si no es una columna de días de dinero
-        if not nombre_limpio.startswith('N°'):
-            df_procesado[nombre_final] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        if pd.notna(rut_col) and pd.notna(monto_col):
+            rut_str = str(rut_col).strip()
+            # Verificar que parece un RUT
+            if '-' in rut_str or (len(rut_str) >= 8 and any(c.isdigit() for c in rut_str)):
+                rut_limpio = limpiar_rut(rut_str)
+                
+                # Inicializar diccionario para este RUT si no existe
+                if rut_limpio not in datos_por_rut:
+                    datos_por_rut[rut_limpio] = {}
+                
+                # Agregar el concepto y monto
+                if concepto_actual:
+                    sufijo = "(H)" if es_haber else "(D)"
+                    nombre_columna = f"{concepto_actual} {sufijo}"
+                    
+                    try:
+                        monto = float(monto_col)
+                        # Si ya existe el concepto, sumar (por si hay duplicados)
+                        if nombre_columna in datos_por_rut[rut_limpio]:
+                            datos_por_rut[rut_limpio][nombre_columna] += monto
+                        else:
+                            datos_por_rut[rut_limpio][nombre_columna] = monto
+                    except:
+                        pass
     
-    return df_procesado
+    # Convertir el diccionario a DataFrame
+    if not datos_por_rut:
+        # Retornar DataFrame vacío con columna RUT
+        return pd.DataFrame(columns=['RUT Trabajador'])
+    
+    df_resultado = pd.DataFrame.from_dict(datos_por_rut, orient='index')
+    df_resultado.reset_index(inplace=True)
+    df_resultado.rename(columns={'index': 'RUT Trabajador'}, inplace=True)
+    
+    # Rellenar NaN con 0
+    df_resultado = df_resultado.fillna(0)
+    
+    return df_resultado
 
 def consolidar_datos(df_libro, df_informe, empresa, mes, rut_empresa):
     """Consolida los datos del libro y el informe"""
@@ -366,7 +395,8 @@ def main():
                 try:
                     # Leer archivos
                     df_libro = pd.read_excel(libro_file)
-                    df_informe = pd.read_excel(informe_file)
+                    # Leer informe SIN encabezado (header=None) para procesar manualmente
+                    df_informe = pd.read_excel(informe_file, header=None)
                     
                     # Procesar
                     df_libro_proc = procesar_libro_remuneraciones(df_libro)
