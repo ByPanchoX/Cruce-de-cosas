@@ -7,8 +7,6 @@ import re
 st.set_page_config(page_title="Consolidador Auditoría Pro 2025", layout="wide", page_icon="🏦")
 
 VALORES_UF_2025 = {"Enero": 38284.86, "Febrero": 38647.94, "Marzo": 38800.00, "Abril": 39050.00, "Mayo": 39200.00, "Junio": 39267.07, "Julio": 39179.01, "Agosto": 39383.07, "Septiembre": 39500.00, "Octubre": 39597.67, "Noviembre": 39643.59, "Diciembre": 39727.96}
-TOPES_AFC_UF_2025 = {m: 131.9 for m in VALORES_UF_2025.keys()}
-TOPES_AFC_UF_2025["Enero"] = 131.8
 
 if 'db' not in st.session_state: st.session_state['db'] = []
 
@@ -31,17 +29,17 @@ def procesar_informe(df):
     if not data: return pd.DataFrame()
     return pd.DataFrame(data).pivot_table(index='RutKey', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
 
-st.title("📊 Consolidador con RUT Trabajador")
+st.title("📊 Consolidador: RUT Trabajador y Empresa")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
     mes = st.selectbox("Mes de Proceso", list(VALORES_UF_2025.keys()))
-    rut_emp = st.text_input("RUT Empresa", "76.455.680-1")
+    rut_emp_input = st.text_input("RUT Empresa (ej: 76.455.680-1)", "76.455.680-1")
     if st.button("🗑️ Limpiar Todo"):
         st.session_state['db'] = []
         st.rerun()
 
-entidad = st.selectbox("Seleccione Empresa:", ["INGEMARS", "ENAP", "Otro"])
+entidad = st.selectbox("Origen de Datos:", ["INGEMARS", "ENAP", "Otro"])
 nombre_entidad = st.text_input("Especifique:") if entidad == "Otro" else entidad
 
 c1, c2, c3 = st.columns(3)
@@ -66,7 +64,6 @@ if f_lib or f_inf or f_pat:
             if f_pat:
                 pat_df = pd.read_excel(f_pat)
                 pat_df['RutKey'] = pat_df['Rut Trabajador'].apply(clean_rut)
-                # Mapeo de columnas solicitadas
                 mapeo = {
                     'Rut Trabajador': 'Rut Trabajador',
                     'Aporte Accidentes de Trabajo IPS': 'Acc. Trabajo IPS (P)',
@@ -80,47 +77,45 @@ if f_lib or f_inf or f_pat:
                 cols_encontradas = [c for c in mapeo.keys() if c in pat_df.columns]
                 pat_data = pat_df[['RutKey'] + cols_encontradas].rename(columns=mapeo)
 
-            # Cruzar datos
-            df_merged = res_lib if not res_lib.empty else (pat_data if not pat_data.empty else inf_pivot)
+            # Fusión de archivos
+            df_curr = res_lib if not res_lib.empty else (pat_data if not pat_data.empty else inf_pivot)
             if not res_lib.empty and not inf_pivot.empty:
-                df_merged = pd.merge(df_merged, inf_pivot, on='RutKey', how='outer')
-            if not pat_data.empty and df_merged is not pat_data:
-                df_merged = pd.merge(df_merged, pat_data, on='RutKey', how='outer', suffixes=('', '_drop'))
+                df_curr = pd.merge(df_curr, inf_pivot, on='RutKey', how='outer')
+            if not pat_data.empty and df_curr is not pat_data:
+                df_curr = pd.merge(df_curr, pat_data, on='RutKey', how='outer', suffixes=('', '_drop'))
 
-            # Asegurar que el RUT no sea nulo (si viene de informe/patronal)
-            if 'Rut Trabajador' not in df_merged.columns or df_merged['Rut Trabajador'].isna().any():
-                # Si falta el RUT formateado, intentamos recuperarlo de los otros archivos
-                if not pat_data.empty: df_merged['Rut Trabajador'] = df_merged['Rut Trabajador'].fillna(pat_data['Rut Trabajador'])
-
-            df_merged.insert(0, 'Empresa_Origen', nombre_entidad)
-            st.session_state['db'].append(df_merged)
-            st.success(f"✅ {nombre_entidad} agregada correctamente.")
+            # Insertar Metadatos Obligatorios
+            df_curr.insert(0, 'Rut Empresa', rut_emp_input)
+            df_curr.insert(1, 'Mes', mes)
+            df_curr.insert(2, 'Año', 2025)
+            df_curr['Origen_Carga'] = nombre_entidad
+            
+            st.session_state['db'].append(df_curr)
+            st.success(f"✅ {nombre_entidad} lista.")
             
         except Exception as e:
             st.error(f"Error: {e}")
 
 if st.session_state['db']:
-    if st.button("🚀 GENERAR EXCEL FINAL"):
+    if st.button("🚀 GENERAR EXCEL CONSOLIDADO"):
         df_all = pd.concat(st.session_state['db'], ignore_index=True)
-        # Fusión crítica: agrupamos por la llave limpia pero mantenemos el RUT formateado
         df_final = df_all.groupby('RutKey').first().reset_index()
         
-        # Limpieza de columnas duplicadas o técnicas
-        df_final = df_final.loc[:, ~df_final.columns.str.contains('_drop$|^RutKey$|^Rut$')]
+        # Limpieza
+        df_final = df_final.loc[:, ~df_final.columns.str.contains('_drop$|^RutKey$')]
         
-        # REORDENAMIENTO: RUT Trabajador en Columna A
-        cols_fijas = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres', 'Cargo', 'Centro de Costo', 'Tipo de Contrato']
+        # ORDEN DE COLUMNAS SOLICITADO
+        cols_fijas = ['Rut Trabajador', 'Rut Empresa', 'Mes', 'Año', 'Apellido Paterno', 'Apellido Materno', 'Nombres', 'Cargo', 'Centro de Costo', 'Tipo de Contrato']
         cols_dias = [c for c in df_final.columns if re.search(r'^[Nn][°º\.\s]', c)]
         cols_hab = sorted([c for c in df_final.columns if '(H)' in c])
         cols_des = sorted([c for c in df_final.columns if '(D)' in c])
         cols_pat = sorted([c for c in df_final.columns if '(P)' in c or 'SIS' in c])
-        resto = [c for c in df_final.columns if c not in cols_fijas + cols_dias + cols_hab + cols_des + cols_pat + ['Empresa_Origen']]
+        resto = [c for c in df_final.columns if c not in cols_fijas + cols_dias + cols_hab + cols_des + cols_pat + ['Origen_Carga']]
         
-        orden_final = [c for c in cols_fijas + cols_dias + cols_hab + cols_des + cols_pat + resto if c in df_final.columns]
-        df_final = df_final[orden_final]
+        df_final = df_final[[c for c in cols_fijas + cols_dias + cols_hab + cols_des + cols_pat + resto if c in df_final.columns]]
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_final.to_excel(writer, index=False)
-        st.download_button("📥 Descargar Excel Consolidado", output.getvalue(), f"Consolidado_{mes}_2025.xlsx")
+        st.download_button("📥 Descargar Reporte Final", output.getvalue(), f"Auditoria_{mes}_2025.xlsx")
         st.dataframe(df_final)
