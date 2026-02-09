@@ -14,6 +14,7 @@ def clean_rut(rut):
     return "".join(filter(lambda x: x.isdigit() or x == 'K', rut))
 
 def parse_informe_con_secciones(df):
+    """Extrae conceptos clasificándolos en HABERES o DESCUENTOS"""
     data = []
     current_section = 'HABERES'
     current_category = None
@@ -82,7 +83,6 @@ if file_libro and file_informe:
             df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
             
             # --- UNIÓN ---
-            # Identificar columna RUT en el libro
             col_rut_libro = [c for c in df_libro_solo_dias.columns if 'Rut' in str(c)][0]
             df_libro_solo_dias['rut_key'] = df_libro_solo_dias[col_rut_libro].apply(clean_rut)
             
@@ -93,7 +93,6 @@ if file_libro and file_informe:
             df_merged.insert(0, 'Mes', mes_sel)
             df_merged.insert(0, 'Empresa', empresa_final)
             
-            # GUARDAR COMO DICCIONARIO
             st.session_state['datos_acumulados'].append({
                 'df': df_merged,
                 'haberes': hab_list,
@@ -107,20 +106,18 @@ if file_libro and file_informe:
 # --- BOTÓN FINAL DE DESCARGA ---
 if st.session_state['datos_acumulados']:
     st.divider()
-    st.subheader("Empresas listas para descargar:")
-    resumen = [{"Empresa": i['df']['Empresa'].iloc[0], "Mes": i['df']['Mes'].iloc[0]} for i in st.session_state['datos_acumulados']]
+    st.subheader("📋 Resumen de carga:")
+    resumen = [{"Empresa": i['df']['Empresa'].iloc[0], "Mes": i['df']['Mes'].iloc[0], "Año": i['df']['Año'].iloc[0]} for i in st.session_state['datos_acumulados']]
     st.table(resumen)
 
-    if st.button("🚀 GENERAR EXCEL FINAL CONSOLIDADO"):
-        # Extraer solo los DataFrames de la lista de diccionarios
+    if st.button("🚀 GENERAR EXCEL FINAL"):
         lista_solo_dfs = [item['df'] for item in st.session_state['datos_acumulados']]
         df_total = pd.concat(lista_solo_dfs, ignore_index=True)
         
-        # Ordenar columnas
+        # Ordenar columnas lógicamente
         ids = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
         dias = [c for c in df_total.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
         
-        # Recolectar nombres de haberes y descuentos
         h_cols = []
         d_cols = []
         for item in st.session_state['datos_acumulados']:
@@ -142,4 +139,13 @@ if st.session_state['datos_acumulados']:
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_total.to_excel(writer, index=False, sheet_name='Consolidado')
         
-        st.download_button(label="📥 Descargar Excel Final", data=output.getvalue(), file_name="Consolidado_Final.xlsx")
+        # NOMBRE DEL ARCHIVO DINÁMICO SEGÚN EL MES Y AÑO SELECCIONADOS
+        nombre_archivo = f"Consolidado_{mes_sel}_{anio_sel}.xlsx"
+        
+        st.download_button(
+            label=f"📥 Descargar {nombre_archivo}", 
+            data=output.getvalue(), 
+            file_name=nombre_archivo,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.dataframe(df_total.head(20))
