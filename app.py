@@ -29,7 +29,7 @@ def procesar_informe(df):
     if not data: return pd.DataFrame()
     return pd.DataFrame(data).pivot_table(index='RutKey', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
 
-st.title("📊 Consolidador: Estructura Empresa - Periodo - Trabajador")
+st.title("📊 Consolidador Final 2025")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
@@ -84,31 +84,40 @@ if f_lib or f_inf or f_pat:
             if not pat_data.empty and df_curr is not pat_data:
                 df_curr = pd.merge(df_curr, pat_data, on='RutKey', how='outer', suffixes=('', '_drop'))
 
-            # Definir columnas de cabecera solicitadas
+            # Insertar cabeceras fijas
             df_curr.insert(0, 'RUT EMPRESA', rut_emp_input)
             df_curr.insert(1, 'MES', mes)
             df_curr.insert(2, 'AÑO', 2025)
             
+            # Guardamos la marca de origen solo para control interno
+            df_curr['__tecnico_origen__'] = nombre_entidad
+            
             st.session_state['db'].append(df_curr)
-            st.success(f"✅ {nombre_entidad} cargada.")
+            st.success(f"✅ {nombre_entidad} lista para consolidar.")
             
         except Exception as e:
             st.error(f"Error: {e}")
 
 if st.session_state['db']:
-    if st.button("🚀 GENERAR EXCEL CONSOLIDADO"):
+    if st.button("🚀 GENERAR EXCEL CONSOLIDADO FINAL", type="primary"):
         df_all = pd.concat(st.session_state['db'], ignore_index=True)
         df_final = df_all.groupby('RutKey').first().reset_index()
-        df_final = df_final.loc[:, ~df_final.columns.str.contains('_drop$|^RutKey$')]
         
-        # ORDEN ESTRICTO SOLICITADO
-        # 1. RUT Empresa, 2. Mes, 3. Año, 4. RUT Trabajador, 5. Otros
+        # --- LIMPIEZA DE COLUMNAS "BASURA" ---
+        # Borramos cualquier columna que contenga nombres técnicos o duplicados
+        basura = ['_drop', 'RutKey', 'Rut', '__tecnico_origen__', 'Empresa', 'Mes', 'Año', 'Origen', 'Origen_Carga']
+        for b in basura:
+            df_final = df_final.loc[:, ~df_final.columns.str.contains(f'^{b}$|{b}_drop', flags=re.IGNORECASE)]
+
+        # ORDEN ESTRICTO
         cols_id = ['RUT EMPRESA', 'MES', 'AÑO', 'Rut Trabajador']
         cols_personales = ['Apellido Paterno', 'Apellido Materno', 'Nombres', 'Cargo', 'Centro de Costo', 'Tipo de Contrato']
-        cols_dias = [c for c in df_final.columns if re.search(r'^[Nn][°º\.\s]', c)]
+        cols_dias = [c for c in df_final.columns if re.search(r'^[Nn][°º\.\s]', str(c))]
         cols_hab = sorted([c for c in df_final.columns if '(H)' in c])
         cols_des = sorted([c for c in df_final.columns if '(D)' in c])
         cols_pat = sorted([c for c in df_final.columns if '(P)' in c or 'SIS' in c])
+        
+        # Cualquier cosa que haya sobrevivido y no esté en las listas anteriores
         resto = [c for c in df_final.columns if c not in cols_id + cols_personales + cols_dias + cols_hab + cols_des + cols_pat]
         
         orden_final = [c for c in cols_id + cols_personales + cols_dias + cols_hab + cols_des + cols_pat + resto if c in df_final.columns]
@@ -117,5 +126,6 @@ if st.session_state['db']:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_final.to_excel(writer, index=False)
-        st.download_button("📥 Descargar Excel", output.getvalue(), f"Consolidado_{mes}_2025.xlsx")
+        
+        st.download_button("📥 Descargar Excel Limpio", output.getvalue(), f"Consolidado_Final_{mes}.xlsx")
         st.dataframe(df_final)
