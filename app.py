@@ -29,12 +29,12 @@ def procesar_informe(df):
     if not data: return pd.DataFrame()
     return pd.DataFrame(data).pivot_table(index='RutKey', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
 
-st.title("📊 Consolidador: RUT Trabajador y Empresa")
+st.title("📊 Consolidador: Estructura Empresa - Periodo - Trabajador")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
     mes = st.selectbox("Mes de Proceso", list(VALORES_UF_2025.keys()))
-    rut_emp_input = st.text_input("RUT Empresa (ej: 76.455.680-1)", "76.455.680-1")
+    rut_emp_input = st.text_input("RUT Empresa", "76.455.680-1")
     if st.button("🗑️ Limpiar Todo"):
         st.session_state['db'] = []
         st.rerun()
@@ -77,21 +77,20 @@ if f_lib or f_inf or f_pat:
                 cols_encontradas = [c for c in mapeo.keys() if c in pat_df.columns]
                 pat_data = pat_df[['RutKey'] + cols_encontradas].rename(columns=mapeo)
 
-            # Fusión de archivos
+            # Fusión
             df_curr = res_lib if not res_lib.empty else (pat_data if not pat_data.empty else inf_pivot)
             if not res_lib.empty and not inf_pivot.empty:
                 df_curr = pd.merge(df_curr, inf_pivot, on='RutKey', how='outer')
             if not pat_data.empty and df_curr is not pat_data:
                 df_curr = pd.merge(df_curr, pat_data, on='RutKey', how='outer', suffixes=('', '_drop'))
 
-            # Insertar Metadatos Obligatorios
-            df_curr.insert(0, 'Rut Empresa', rut_emp_input)
-            df_curr.insert(1, 'Mes', mes)
-            df_curr.insert(2, 'Año', 2025)
-            df_curr['Origen_Carga'] = nombre_entidad
+            # Definir columnas de cabecera solicitadas
+            df_curr.insert(0, 'RUT EMPRESA', rut_emp_input)
+            df_curr.insert(1, 'MES', mes)
+            df_curr.insert(2, 'AÑO', 2025)
             
             st.session_state['db'].append(df_curr)
-            st.success(f"✅ {nombre_entidad} lista.")
+            st.success(f"✅ {nombre_entidad} cargada.")
             
         except Exception as e:
             st.error(f"Error: {e}")
@@ -100,22 +99,23 @@ if st.session_state['db']:
     if st.button("🚀 GENERAR EXCEL CONSOLIDADO"):
         df_all = pd.concat(st.session_state['db'], ignore_index=True)
         df_final = df_all.groupby('RutKey').first().reset_index()
-        
-        # Limpieza
         df_final = df_final.loc[:, ~df_final.columns.str.contains('_drop$|^RutKey$')]
         
-        # ORDEN DE COLUMNAS SOLICITADO
-        cols_fijas = ['Rut Trabajador', 'Rut Empresa', 'Mes', 'Año', 'Apellido Paterno', 'Apellido Materno', 'Nombres', 'Cargo', 'Centro de Costo', 'Tipo de Contrato']
+        # ORDEN ESTRICTO SOLICITADO
+        # 1. RUT Empresa, 2. Mes, 3. Año, 4. RUT Trabajador, 5. Otros
+        cols_id = ['RUT EMPRESA', 'MES', 'AÑO', 'Rut Trabajador']
+        cols_personales = ['Apellido Paterno', 'Apellido Materno', 'Nombres', 'Cargo', 'Centro de Costo', 'Tipo de Contrato']
         cols_dias = [c for c in df_final.columns if re.search(r'^[Nn][°º\.\s]', c)]
         cols_hab = sorted([c for c in df_final.columns if '(H)' in c])
         cols_des = sorted([c for c in df_final.columns if '(D)' in c])
         cols_pat = sorted([c for c in df_final.columns if '(P)' in c or 'SIS' in c])
-        resto = [c for c in df_final.columns if c not in cols_fijas + cols_dias + cols_hab + cols_des + cols_pat + ['Origen_Carga']]
+        resto = [c for c in df_final.columns if c not in cols_id + cols_personales + cols_dias + cols_hab + cols_des + cols_pat]
         
-        df_final = df_final[[c for c in cols_fijas + cols_dias + cols_hab + cols_des + cols_pat + resto if c in df_final.columns]]
+        orden_final = [c for c in cols_id + cols_personales + cols_dias + cols_hab + cols_des + cols_pat + resto if c in df_final.columns]
+        df_final = df_final[orden_final]
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_final.to_excel(writer, index=False)
-        st.download_button("📥 Descargar Reporte Final", output.getvalue(), f"Auditoria_{mes}_2025.xlsx")
+        st.download_button("📥 Descargar Excel", output.getvalue(), f"Consolidado_{mes}_2025.xlsx")
         st.dataframe(df_final)
