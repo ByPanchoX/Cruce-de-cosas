@@ -69,7 +69,7 @@ if file_libro and file_informe:
             df_libro_raw = pd.read_excel(file_libro)
             df_informe_raw = pd.read_excel(file_informe)
             
-            # --- FILTRO DE DÍAS ---
+            # --- FILTRO DE DÍAS (SOLO LO QUE PIDIÓ EL USUARIO) ---
             cols_id = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
             cols_dias = [c for c in df_libro_raw.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
             columnas_finales_libro = [c for c in (cols_id + cols_dias) if c in df_libro_raw.columns]
@@ -80,13 +80,27 @@ if file_libro and file_informe:
             hab_list = df_parsed[df_parsed['Seccion'] == 'HABERES']['Concepto'].unique().tolist()
             des_list = df_parsed[df_parsed['Seccion'] == 'DESCUENTOS']['Concepto'].unique().tolist()
             
+            # Pivotar el informe
             df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
             
+            # EVITAR DUPLICADOS: Si un concepto ya existe en las columnas de "Días", lo renombramos
+            for col in df_pivot.columns:
+                if col != 'Rut' and col in df_libro_solo_dias.columns:
+                    nuevo_nombre = f"{col} (Monto)"
+                    df_pivot = df_pivot.rename(columns={col: nuevo_nombre})
+                    if col in hab_list: hab_list[hab_list.index(col)] = nuevo_nombre
+                    if col in des_list: des_list[des_list.index(col)] = nuevo_nombre
+
             # --- UNIÓN ---
             col_rut_libro = [c for c in df_libro_solo_dias.columns if 'Rut' in str(c)][0]
             df_libro_solo_dias['rut_key'] = df_libro_solo_dias[col_rut_libro].apply(clean_rut)
             
-            df_merged = pd.merge(df_libro_solo_dias, df_pivot, left_on='rut_key', right_on='Rut', how='left').drop(columns=['rut_key', 'Rut'])
+            # Merge final sin duplicar columnas
+            df_merged = pd.merge(df_libro_solo_dias, df_pivot, left_on='rut_key', right_on='Rut', how='left')
+            
+            # Limpiar columnas auxiliares de unión
+            if 'rut_key' in df_merged.columns: df_merged = df_merged.drop(columns=['rut_key'])
+            if 'Rut' in df_merged.columns: df_merged = df_merged.drop(columns=['Rut'])
             
             # Insertar metadatos
             df_merged.insert(0, 'Año', anio_sel)
@@ -106,17 +120,24 @@ if file_libro and file_informe:
 # --- BOTÓN FINAL DE DESCARGA ---
 if st.session_state['datos_acumulados']:
     st.divider()
-    st.subheader("📋 Resumen de carga:")
-    resumen = [{"Empresa": i['df']['Empresa'].iloc[0], "Mes": i['df']['Mes'].iloc[0], "Año": i['df']['Año'].iloc[0]} for i in st.session_state['datos_acumulados']]
-    st.table(resumen)
+    st.subheader("📋 Resumen de carga actual:")
+    resumen_data = []
+    for i in st.session_state['datos_acumulados']:
+        resumen_data.append({
+            "Empresa": i['df']['Empresa'].iloc[0], 
+            "Mes": i['df']['Mes'].iloc[0], 
+            "Año": i['df']['Año'].iloc[0]
+        })
+    st.table(resumen_data)
 
     if st.button("🚀 GENERAR EXCEL FINAL"):
+        # Unir todos los DataFrames guardados
         lista_solo_dfs = [item['df'] for item in st.session_state['datos_acumulados']]
         df_total = pd.concat(lista_solo_dfs, ignore_index=True)
         
-        # Ordenar columnas lógicamente
+        # Organizar el orden de las columnas para que sea limpio
         ids = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
-        dias = [c for c in df_total.columns if 'dia' in str(c).lower() or 'día' in str(c).lower()]
+        dias = [c for c in df_total.columns if ('dia' in str(c).lower() or 'día' in str(c).lower()) and c not in ids]
         
         h_cols = []
         d_cols = []
@@ -129,23 +150,25 @@ if st.session_state['datos_acumulados']:
         
         resto = [c for c in df_total.columns if c not in (ids + dias + h_final + d_final)]
         
+        # Eliminar duplicados del orden y construir lista final
         orden_final = []
         for c in (ids + dias + h_final + d_final + resto):
             if c not in orden_final: orden_final.append(c)
             
         df_total = df_total[orden_final]
         
+        # Exportar a Excel
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_total.to_excel(writer, index=False, sheet_name='Consolidado')
         
-        # NOMBRE DEL ARCHIVO DINÁMICO SEGÚN EL MES Y AÑO SELECCIONADOS
-        nombre_archivo = f"Consolidado_{mes_sel}_{anio_sel}.xlsx"
+        # Nombre del archivo basado en el mes/año actual
+        nombre_descarga = f"Consolidado_{mes_sel}_{anio_sel}.xlsx"
         
         st.download_button(
-            label=f"📥 Descargar {nombre_archivo}", 
+            label=f"📥 Descargar {nombre_descarga}", 
             data=output.getvalue(), 
-            file_name=nombre_archivo,
+            file_name=nombre_descarga,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
         st.dataframe(df_total.head(20))
