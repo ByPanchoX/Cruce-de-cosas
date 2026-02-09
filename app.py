@@ -4,7 +4,7 @@ import io
 import unicodedata
 import re
 
-st.set_page_config(page_title="Consolidador Remuneraciones RUT", layout="wide")
+st.set_page_config(page_title="Consolidador Remuneraciones RUT Único", layout="wide")
 
 # Inicializar la lista de datos si no existe
 if 'datos_acumulados' not in st.session_state:
@@ -16,7 +16,6 @@ def clean_rut(rut):
     return "".join(filter(lambda x: x.isdigit() or x == 'K', rut))
 
 def parse_informe(df):
-    """Extrae conceptos del informe de haberes y descuentos"""
     data = []
     current_section = 'HABERES'
     current_category = None
@@ -34,13 +33,15 @@ def parse_informe(df):
     return pd.DataFrame(data)
 
 # --- INTERFAZ ---
-st.title("📊 Consolidador de Remuneraciones por RUT")
+st.title("📊 Consolidador: Identificador de Carga + RUT Único")
 
 with st.sidebar:
-    st.header("Configuración")
-    # Cambio solicitado: Ahora se ingresa el RUT de la empresa
-    rut_empresa = st.text_input("RUT de la Empresa (Ej: 76.455.680-1)", placeholder="12.345.678-9")
+    st.header("1. Datos Globales")
+    # Este RUT es el que saldrá en la columna 'Empresa' para todos en el Excel
+    rut_unico_excel = st.text_input("RUT Empresa para el Excel", value="76.455.680-1")
     
+    st.divider()
+    st.header("2. Periodo")
     mes_sel = st.selectbox("Mes", ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"])
     anio_sel = st.number_input("Año", 2025)
     
@@ -49,84 +50,91 @@ with st.sidebar:
         st.session_state['datos_acumulados'] = []
         st.rerun()
 
+# Nombre interno para que el usuario sepa qué carga está haciendo
+st.subheader("Carga Individual")
+identificador_carga = st.selectbox("Identificar esta carga como:", ["INGEMARS", "ENAP", "Otra..."])
+if identificador_carga == "Otra...":
+    nombre_carga = st.text_input("Escriba el nombre de la empresa/carga")
+else:
+    nombre_carga = identificador_carga
+
 col1, col2 = st.columns(2)
 with col1:
-    file_libro = st.file_uploader("1. Libro de Remuneraciones (.xlsx)", type=["xlsx"])
+    file_libro = st.file_uploader(f"Libro Remuneraciones - {nombre_carga}", type=["xlsx"])
 with col2:
-    file_informe = st.file_uploader("2. Informe Haberes y Descuentos (.xlsx)", type=["xlsx"])
+    file_informe = st.file_uploader(f"Informe Haberes/Descuentos - {nombre_carga}", type=["xlsx"])
 
 if file_libro and file_informe:
-    if not rut_empresa:
-        st.warning("⚠️ Por favor, ingresa el RUT de la empresa en la barra lateral.")
-    else:
-        if st.button(f"➕ Agregar Empresa RUT: {rut_empresa}"):
-            try:
-                df_lib = pd.read_excel(file_libro)
-                df_inf_raw = pd.read_excel(file_informe)
-                
-                # --- FILTRO RADICAL DEL LIBRO ---
-                id_cols = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
-                
-                # Buscamos columnas de conteo con regex (N°, Nº, N. o N )
-                conteos = [c for c in df_lib.columns if re.search(r'^[Nn][°º\.\s]', str(c))]
-                
-                # Reconstruimos el libro SOLO con identificación y conteos de días
-                df_lib_clean = df_lib[[c for c in id_cols + conteos if c in df_lib.columns]].copy()
-                
-                # Borramos cualquier columna que diga 'dia' pero no tenga el símbolo de número
-                intrusa_cols = [c for c in df_lib_clean.columns if ('dia' in str(c).lower() or 'día' in str(c).lower()) and not re.search(r'^[Nn][°º\.\s]', str(c))]
-                df_lib_clean = df_lib_clean.drop(columns=intrusa_cols)
-                
-                # --- PROCESAR INFORME (DINERO) ---
-                df_parsed = parse_informe(df_inf_raw)
-                df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
-                
-                # Renombrar para evitar choques
-                renames = {}
-                for col in df_pivot.columns:
-                    if col == 'Rut': continue
-                    if 'dia' in col.lower() or 'día' in col.lower():
-                        renames[col] = f"{col} (Monto)"
-                df_pivot = df_pivot.rename(columns=renames)
+    if st.button(f"➕ Agregar datos de {nombre_carga} a la lista"):
+        try:
+            df_lib = pd.read_excel(file_libro)
+            df_inf_raw = pd.read_excel(file_informe)
+            
+            # --- FILTRO DE DÍAS (Solo N°) ---
+            id_cols = ['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
+            conteos = [c for c in df_lib.columns if re.search(r'^[Nn][°º\.\s]', str(c))]
+            df_lib_clean = df_lib[[c for c in id_cols + conteos if c in df_lib.columns]].copy()
+            
+            # Limpieza de duplicados de texto de días
+            drop_c = [c for c in df_lib_clean.columns if ('dia' in str(c).lower() or 'día' in str(c).lower()) and not re.search(r'^[Nn][°º\.\s]', str(c))]
+            df_lib_clean = df_lib_clean.drop(columns=drop_c)
+            
+            # --- PROCESAR INFORME (DINERO) ---
+            df_parsed = parse_informe(df_inf_raw)
+            df_pivot = df_parsed.pivot_table(index='Rut', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
+            
+            # Renombrar para claridad
+            rens = {c: f"{c} (Monto)" for c in df_pivot.columns if c != 'Rut' and ('dia' in c.lower() or 'día' in c.lower())}
+            df_pivot = df_pivot.rename(columns=rens)
 
-                # --- UNIÓN ---
-                rut_col = [c for c in df_lib_clean.columns if 'Rut' in str(c)][0]
-                df_lib_clean['rut_key'] = df_lib_clean[rut_col].apply(clean_rut)
-                
-                df_merged = pd.merge(df_lib_clean, df_pivot, left_on='rut_key', right_on='Rut', how='left').drop(columns=['rut_key', 'Rut'])
-                
-                # Insertar RUT Empresa como columna 'Empresa'
-                df_merged.insert(0, 'Año', anio_sel)
-                df_merged.insert(0, 'Mes', mes_sel)
-                df_merged.insert(0, 'Empresa', rut_empresa)
-                
-                st.session_state['datos_acumulados'].append(df_merged)
-                st.success(f"✅ Empresa {rut_empresa} agregada correctamente.")
-                
-            except Exception as e:
-                st.error(f"Error: {e}")
+            # --- UNIÓN ---
+            rut_c = [c for c in df_lib_clean.columns if 'Rut' in str(c)][0]
+            df_lib_clean['rut_key'] = df_lib_clean[rut_c].apply(clean_rut)
+            df_merged = pd.merge(df_lib_clean, df_pivot, left_on='rut_key', right_on='Rut', how='left').drop(columns=['rut_key', 'Rut'])
+            
+            # Aquí es donde guardamos el nombre_carga para la tabla de la APP, 
+            # pero el rut_unico_excel para la columna Empresa
+            df_merged.insert(0, 'Año', anio_sel)
+            df_merged.insert(0, 'Mes', mes_sel)
+            df_merged.insert(0, 'Empresa', rut_unico_excel) # Siempre usamos el RUT de la barra lateral
+            df_merged['Carga_Origen'] = nombre_carga # Columna auxiliar para control interno
 
-# --- DESCARGA ---
+            st.session_state['datos_acumulados'].append(df_merged)
+            st.success(f"✅ Datos de {nombre_carga} listos. Se mostrarán con el RUT {rut_unico_excel}")
+            
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+# --- SECCIÓN FINAL ---
 if st.session_state['datos_acumulados']:
     st.divider()
-    if st.button("🚀 GENERAR EXCEL FINAL SIN DUPLICADOS"):
+    st.subheader("📋 Resumen de cargas en memoria")
+    resumen = []
+    for d in st.session_state['datos_acumulados']:
+        resumen.append({"Carga": d['Carga_Origen'].iloc[0], "RUT en Excel": d['Empresa'].iloc[0], "Empleados": len(d)})
+    st.table(pd.DataFrame(resumen))
+
+    if st.button("🚀 GENERAR EXCEL FINAL"):
         df_total = pd.concat(st.session_state['datos_acumulados'], ignore_index=True)
         
-        # Eliminar cualquier duplicado técnico de columnas
+        # Eliminamos la columna auxiliar antes de exportar
+        if 'Carga_Origen' in df_total.columns:
+            df_total = df_total.drop(columns=['Carga_Origen'])
+            
         df_total = df_total.loc[:, ~df_total.columns.duplicated()]
 
-        # Limpieza final de columnas de texto de días que no son conteo ni monto del informe
-        final_drop = [c for c in df_total.columns if ('dia' in str(c).lower() or 'día' in str(c).lower()) 
-                      and not re.search(r'^[Nn][°º\.\s]', str(c)) 
-                      and '(Monto)' not in str(c)]
-        df_total = df_total.drop(columns=final_drop)
+        # Limpieza final de columnas de texto de días
+        final_d = [c for c in df_total.columns if ('dia' in str(c).lower() or 'día' in str(c).lower()) 
+                   and not re.search(r'^[Nn][°º\.\s]', str(c)) 
+                   and '(Monto)' not in str(c)]
+        df_total = df_total.drop(columns=final_d)
 
-        # ORDEN DE COLUMNAS
+        # Orden de columnas
         ids = ['Empresa', 'Mes', 'Año', 'Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres']
         dias_n = [c for c in df_total.columns if re.search(r'^[Nn][°º\.\s]', str(c))]
-        otros = [c for c in df_total.columns if c not in ids and c not in dias_n]
+        otros = sorted([c for c in df_total.columns if c not in ids and c not in dias_n])
         
-        df_total = df_total[ids + dias_n + sorted(otros)]
+        df_total = df_total[ids + dias_n + otros]
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
