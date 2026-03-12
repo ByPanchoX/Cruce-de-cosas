@@ -1,342 +1,292 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from io import BytesIO
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-import re
+# ============================================================
+#  COMBINADOR DE REMUNERACIONES — Google Colab  v4 FINAL
+#  Funciona con plantilla VACÍA (solo encabezados).
+#  Crea las filas desde cero usando los RUTs del consolidado.
+# ============================================================
+# USO:
+#  1. Pega este script en una celda de Colab
+#  2. Ejecuta:  main()
+#  3. Sube la Plantilla Maestra (vacía con solo encabezados)
+#  4. Sube el Consolidado de Remuneraciones
+#  5. El archivo combinado se descarga automáticamente
+# ============================================================
 
-# Valores UF 2025
-UF_2025 = {
-    'Enero': 38284.86,
-    'Febrero': 38647.94,
-    'Marzo': 38800.00,
-    'Abril': 39050.00,
-    'Mayo': 39200.00,
-    'Junio': 39267.07,
-    'Julio': 39179.01,
-    'Agosto': 39383.07,
-    'Septiembre': 39500.00,
-    'Octubre': 39597.67,
-    'Noviembre': 39643.59,
-    'Diciembre': 39727.96
+import re, io, numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+from pathlib import Path
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+OUTPUT_FILE = "plantilla_combinada.xlsx"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+def limpiar_rut(v):
+    if pd.isna(v): return ""
+    return re.sub(r"[\.\-\s]", "", str(v)).upper()
+
+def to_num(v):
+    if pd.isna(v) or str(v).strip() in ("", "nan", "None"): return 0.0
+    try: return float(str(v).replace(",", ".").replace(" ", ""))
+    except: return 0.0
+
+def detectar_header_consolidado(path_o_bytes, es_csv=False):
+    """Detecta fila con 'Rut' en consolidado."""
+    raw = (pd.read_csv(path_o_bytes, header=None, dtype=str) if es_csv
+           else pd.read_excel(path_o_bytes, header=None, dtype=str, sheet_name=0))
+    for idx, row in raw.iterrows():
+        if any(isinstance(c, str) and "rut" in c.lower() for c in row.values):
+            df = raw.iloc[idx:].reset_index(drop=True)
+            df.columns = df.iloc[0]
+            return df.iloc[1:].reset_index(drop=True), idx
+    raise ValueError("No se encontró columna 'Rut' en consolidado.")
+
+# ── Subida de archivos ────────────────────────────────────────
+
+def subir():
+    if IN_COLAB:
+        print("📂 Sube la PLANTILLA MAESTRA (.xlsx):")
+        up = files.upload()
+        nombre_p = list(up.keys())[0]
+        bytes_p  = io.BytesIO(up[nombre_p])
+
+        print("\n📂 Sube el CONSOLIDADO DE REMUNERACIONES (.xlsx o .csv):")
+        up = files.upload()
+        nombre_c = list(up.keys())[0]
+        bytes_c  = io.BytesIO(up[nombre_c])
+    else:
+        nombre_p = "plantilla_maestra.xlsx"
+        nombre_c = "consolidado.xlsx"
+        bytes_p  = nombre_p
+        bytes_c  = nombre_c
+    return bytes_p, nombre_p, bytes_c, nombre_c
+
+# ── MAPEO DE COLUMNAS ────────────────────────────────────────
+#
+# Estructura: (col_PLANTILLA, [cols_CONSOLIDADO], operacion)
+#   "first"  → primer valor no vacío de la lista
+#   "sum"    → suma todos los valores
+#   "yyyymm" → año + mes → formato AAAAMM
+#
+
+MAPEO_MANUAL = [
+    ("Rut Razón Social *",                       ["RUT EMPRESA"],                                        "first"),
+    ("Rut *",                                    ["Rut Trabajador"],                                     "first"),
+    ("Año_Mes (aaaamm) *",                       ["AÑO", "MES"],                                         "yyyymm"),
+    
+    # ── Leyes Sociales ────────────────────────────────────────
+    ("Total Isapre *",                            ["Cotización Institución de Salud (D)",
+                                                   "Cotización Voluntaria a Isapre (D)"],                "sum"),
+    ("Seguro Cesantía Trabajador *",              ["Descuento Seguro Cesantia (D)"],                     "first"),
+    ("AFP *",                                     ["Descuento Cotización AFP (D)"],                      "first"),
+    ("Impuestos *",                               ["Impuesto Unico (D)"],                                "first"),
+    ("Seguro Invalidez y Supervivencia (SIS) *",  ["Seguro de Invalidez y Sobrevivencia Empleador (P)"], "first"),
+    ("Seguro Accidente de Trabajo *",             ["Aporte Accidentes de Trabajo Mutual (P)"],           "first"),
+    ("Seguro Cesantía Empleador *",               ["Seguro de Cesantía Empleador (P)"],                  "first"),
+    ("Expectativa de Vida",                       ["Expectativa de Vida Seguro Social (P)"],             "first"),
+    ("Capitalización Individual AFP",             ["Adicional de Capitalización Individual AFP (P)"],    "first"),
+    
+    # ── Días ──────────────────────────────────────────────────
+    ("Días Trabajados del Mes *",                 ["N° Dias Trabajados"],                                "first"),
+    ("Días de Ausentismo *",                      ["N° Dias Ausentes"],                                  "first"),
+    ("Días de licencia médica *",                 ["N° Dias Licencia"],                                  "first"),
+    
+    # ── Remuneraciones ────────────────────────────────────────
+    ("Sueldo Base *",                             ["Sueldo Base (H)"],                                   "first"),
+    ("Mensual *",                                 ["Gratificación Legal (H)"],                           "first"),
+    ("Remuneración Imponible *",                  ["Total Imponible (H)"],                               "first"),
+    
+    # ── Haberes ───────────────────────────────────────────────
+    ("Movilización",                              ["Movilización (H)"],                                  "first"),
+    ("Colación",                                  ["Colación (H)"],                                      "first"),
+    ("Asignación familiar y Maternal",            ["Asignacion Familiar (H)"],                           "first"),
+    ("Aguinaldo (h)",                             ["AGUINALDO (H)", "Aguinaldo (H)"],                    "sum"),
+    
+    # ── Descuentos ────────────────────────────────────────────
+    ("Descuento Anticipo",                        ["Anticipos (D)"],                                     "first"),
+    ("Descuento Crédito Personal CCAF",           ["Créditos Personales CCAF (D)"],                      "first"),
+    ("anticipo D",                                ["ANTICIPO AGUINALDO (D)", "Anticipo Aguinaldo (D)"],  "sum"),
+]
+
+# Mapeo automático: columnas con mismo nombre
+MAPEO_AUTO = [
+    ("ASIGNACION DE VIATICO (H)",            "ASIGNACION DE VIATICO (H)"),
+    ("ASIGNACION VIATICO MEU (H)",           "ASIGNACION VIATICO MEU (H)"),
+    ("Asignación Capacitación (H)",          "Asignación Capacitación (H)"),
+    ("Asignación Navidad (H)",               "Asignación Navidad (H)"),
+    ("Asignación de Cargo (H)",              "Asignación de Cargo (H)"),
+    ("Asignación de Telefono (H)",           "Asignación de Telefono (H)"),
+    ("BONO ADMINISTRACION (H)",              "BONO ADMINISTRACION (H)"),
+    ("BONO PMI (H)",                         "BONO PMI (H)"),
+    ("BONO RECONOCIMIENTO (H)",              "BONO RECONOCIMIENTO (H)"),
+    ("Bono Calidad (H)",                     "Bono Calidad (H)"),
+    ("Bono Extraordinario (H)",              "Bono Extraordinario (H)"),
+    ("Bono Producción (H)",                  "Bono Producción (H)"),
+    ("Bono Reconocimiento (H)",              "Bono Reconocimiento (H)"),
+    ("Bono Vacaciones (H)",                  "Bono Vacaciones (H)"),
+    ("Bono años de servicio (H)",            "Bono años de servicio (H)"),
+    ("Bono de Faena (H)",                    "Bono de Faena (H)"),
+    ("Bono de Productividad (H)",            "Bono de Productividad (H)"),
+    ("Bono por Asistencia (H)",              "Bono por Asistencia (H)"),
+    ("Compensacion dia feriado (H)",         "Compensacion dia feriado (H)"),
+    ("DIAS PARO (H)",                        "DIAS PARO (H)"),
+    ("Gastos Reembolsables (H)",             "Gastos Reembolsables (H)"),
+    ("HORAS EXTRAS DEL MES (H)",             "HORAS EXTRAS DEL MES (H)"),
+    ("ICTP (H)",                             "ICTP (H)"),
+    ("Incentivo de Desempeño (H)",           "Incentivo de Desempeño (H)"),
+    ("Internet (H)",                         "Internet (H)"),
+    ("Llamado de Emergencia (H)",            "Llamado de Emergencia (H)"),
+    ("MOVILIZACION ENAP (H)",                "MOVILIZACION ENAP (H)"),
+    ("Reconocimiento Mentoria (H)",          "Reconocimiento Mentoria (H)"),
+    ("Sobretiempo (H)",                      "Sobretiempo (H)"),
+    ("Sobretiempo Festivo (H)",              "Sobretiempo Festivo (H)"),
+    ("Viatico Alojamiento (H)",              "Viatico Alojamiento (H)"),
+    ("Visita Adicional (H)",                 "Visita Adicional (H)"),
+    ("Otros Descuentos",                     "Otros Descuentos (D)"),
+    ("Anticipo Asignación Capacitación (D)", "Anticipo Asignación Capacitación (D)"),
+    ("Anticipo Asignación Navidad (D)",      "Anticipo Asignación Navidad (D)"),
+    ("Anticipo Bono Calidad (D)",            "Anticipo Bono Calidad (D)"),
+    ("Anticipo Bono Producción (D)",         "Anticipo Bono Producción (D)"),
+    ("Anticipo Bono Vacaciones (D)",         "Anticipo Bono Vacaciones (D)"),
+    ("Anticipo bono años de servicio (D)",   "Anticipo bono años de servicio (D)"),
+    ("Anticipos (D)",                        "Anticipos (D)"),
+    ("Crédito Fonasa (D)",                   "Crédito Fonasa (D)"),
+    ("Descuento cuota Sindicato (D)",        "Descuento cuota Sindicato (D)"),
+    ("Descuentos por Leasing (D)",           "Descuentos por Leasing (D)"),
+    ("Gastos Particulares (D)",              "Gastos Particulares (D)"),
+    ("Gastos Reembolsables (D)",             "Gastos Reembolsables (D)"),
+    ("Prestamo Empresa (D)",                 "Prestamo Empresa (D)"),
+    ("Retencion Pension de Alimentos (D)",   "Retencion Pension de Alimentos (D)"),
+    ("Seguro Vida Camara (D)",               "Seguro Vida Camara (D)"),
+    ("Seguro de vida CCAF (D)",              "Seguro de vida CCAF (D)"),
+]
+
+# Diccionario meses
+MESES = {
+    "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+    "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+    "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12"
 }
 
-MESES_2025 = list(UF_2025.keys())
-TOPE_UF = 131.8
+# ── Motor de combinación ──────────────────────────────────────
 
-def limpiar_rut(rut):
-    """Limpia el formato del RUT"""
-    if pd.isna(rut):
-        return ''
-    rut_str = str(rut).strip()
-    rut_str = re.sub(r'[.\-]', '', rut_str)
-    return rut_str
-
-def calcular_seguro_cesantia_empleador(row, valor_uf):
-    """Calcula el seguro de cesantía empleador según tipo de contrato"""
-    imponible = row.get('Total Imponible (H)', 0)
-    seguro_trabajador = row.get('Seguro de Cesantía', 0)
+def combinar(bytes_p, nombre_p, bytes_c, nombre_c):
+    # 1. Leer estructura de plantilla vacía
+    print("\n🔍 Leyendo plantilla maestra…")
+    wb_plantilla = load_workbook(bytes_p)
+    ws_plantilla = wb_plantilla.active
     
-    if pd.isna(imponible) or imponible == 0:
-        return 0
+    columnas_plantilla = []
+    fila_header = 3  # Fila 3 = encabezados
+    for i in range(1, ws_plantilla.max_column + 1):
+        h = ws_plantilla.cell(fila_header, i).value
+        if h:
+            columnas_plantilla.append(h)
     
-    tope_pesos = TOPE_UF * valor_uf
-    base_calculo = min(imponible, tope_pesos)
+    print(f"   {len(columnas_plantilla)} columnas en plantilla")
     
-    # Determinar tipo de contrato
-    if pd.notna(seguro_trabajador) and seguro_trabajador > 0:
-        tasa = 0.024  # Indefinido
-    else:
-        tasa = 0.030  # Plazo Fijo/Obra
+    # 2. Leer consolidado
+    print("🔍 Leyendo consolidado…")
+    es_csv = nombre_c.lower().endswith(".csv")
+    df_c, _ = detectar_header_consolidado(bytes_c, es_csv)
+    print(f"   {len(df_c)} personas en consolidado")
     
-    return round(base_calculo * tasa, 0)
-
-def procesar_libro_remuneraciones(df_libro, rut_empresa):
-    """Procesa el libro de remuneraciones extrayendo las columnas necesarias"""
-    df_procesado = pd.DataFrame()
+    # 3. Crear DataFrame vacío con estructura plantilla
+    df_resultado = pd.DataFrame(columns=columnas_plantilla)
     
-    # RUT Empresa
-    df_procesado['Empresa'] = rut_empresa
-    
-    # RUT Trabajador
-    if 'RUT Trabajador' in df_libro.columns:
-        df_procesado['RUT Trabajador'] = df_libro['RUT Trabajador'].apply(limpiar_rut)
-    
-    # Nombres completos
-    apellido_paterno = df_libro.get('Apellido Paterno', '')
-    apellido_materno = df_libro.get('Apellido Materno', '')
-    nombres = df_libro.get('Nombres', '')
-    
-    df_procesado['Nombres Completos'] = (
-        apellido_paterno.fillna('').astype(str) + ' ' +
-        apellido_materno.fillna('').astype(str) + ' ' +
-        nombres.fillna('').astype(str)
-    ).str.strip()
-    
-    # Extraer columnas de días (solo las que empiezan con 'N°')
-    columnas_dias = [col for col in df_libro.columns if col.startswith('N°')]
-    for col in columnas_dias:
-        df_procesado[col] = df_libro[col]
-    
-    # Total Imponible
-    if 'Imponible' in df_libro.columns:
-        df_procesado['Total Imponible (H)'] = df_libro['Imponible']
-    
-    # Seguro de Cesantía (para cálculo posterior)
-    if 'Seguro de Cesantía' in df_libro.columns:
-        df_procesado['Seguro de Cesantía'] = df_libro['Seguro de Cesantía']
-    else:
-        df_procesado['Seguro de Cesantía'] = 0
-    
-    return df_procesado
-
-def procesar_haberes_descuentos(df_informe):
-    """Procesa el informe de haberes y descuentos"""
-    df_procesado = pd.DataFrame()
-    
-    # Identificar columnas de haberes y descuentos
-    for col in df_informe.columns:
-        col_limpia = col.replace('(Monto)', '').strip()
+    # 4. Procesar cada persona del consolidado
+    print("\n⚙️  Procesando filas…")
+    for idx, row_c in df_c.iterrows():
+        nueva_fila = {}
         
-        # Clasificar por tipo
-        if 'haber' in col.lower() or col_limpia in ['Sueldo Base', 'Gratificación', 'Bono', 'Horas Extras']:
-            nueva_col = f"{col_limpia} (H)"
-        elif 'descuento' in col.lower() or col_limpia in ['AFP', 'Salud', 'Impuesto']:
-            nueva_col = f"{col_limpia} (D)"
-        else:
-            # Intentar clasificar por contenido
-            if df_informe[col].sum() > 0:
-                nueva_col = f"{col_limpia} (H)"
-            else:
-                nueva_col = f"{col_limpia} (D)"
+        # Mapeo manual
+        for col_dest, cols_src, op in MAPEO_MANUAL:
+            if op == "yyyymm":
+                año = str(row_c.get("AÑO", "")).strip()
+                mes = str(row_c.get("MES", "")).strip().lower()
+                mes_num = MESES.get(mes, "")
+                nueva_fila[col_dest] = f"{año}{mes_num}" if año and mes_num else None
+            elif op == "sum":
+                total = sum(to_num(row_c.get(c)) for c in cols_src if c in df_c.columns)
+                nueva_fila[col_dest] = str(int(round(total))) if total != 0 else None
+            else:  # "first"
+                val = None
+                for c in cols_src:
+                    if c in df_c.columns and not pd.isna(row_c[c]) and str(row_c[c]).strip() not in ("", "nan"):
+                        val = row_c[c]
+                        break
+                nueva_fila[col_dest] = val
         
-        df_procesado[nueva_col] = df_informe[col]
+        # Mapeo automático
+        for col_dest, col_src in MAPEO_AUTO:
+            if col_src in df_c.columns:
+                val = row_c[col_src]
+                nueva_fila[col_dest] = val if not pd.isna(val) and str(val).strip() not in ("", "nan") else None
+        
+        df_resultado = pd.concat([df_resultado, pd.DataFrame([nueva_fila])], ignore_index=True)
     
-    return df_procesado
+    print(f"✅ {len(df_resultado)} filas creadas")
+    return df_resultado, columnas_plantilla, fila_header
 
-def consolidar_datos(datos_empresas, mes, año):
-    """Consolida los datos de todas las empresas"""
-    if not datos_empresas:
-        return None
-    
-    df_consolidado = pd.concat(datos_empresas, ignore_index=True)
-    
-    # Agregar Mes y Año
-    df_consolidado.insert(1, 'Mes', mes)
-    df_consolidado.insert(2, 'Año', año)
-    
-    # Ordenar columnas
-    columnas_fijas = ['Empresa', 'Mes', 'Año', 'RUT Trabajador', 'Nombres Completos']
-    columnas_dias = [col for col in df_consolidado.columns if col.startswith('N°')]
-    columnas_haberes = [col for col in df_consolidado.columns if col.endswith('(H)')]
-    columnas_descuentos = [col for col in df_consolidado.columns if col.endswith('(D)')]
-    
-    # Remover columna temporal de Seguro de Cesantía si existe
-    if 'Seguro de Cesantía' in df_consolidado.columns:
-        df_consolidado = df_consolidado.drop(columns=['Seguro de Cesantía'])
-    
-    columnas_otras = [col for col in df_consolidado.columns 
-                     if col not in columnas_fijas + columnas_dias + columnas_haberes + columnas_descuentos]
-    
-    orden_final = columnas_fijas + columnas_dias + columnas_haberes + columnas_descuentos + columnas_otras
-    orden_final = [col for col in orden_final if col in df_consolidado.columns]
-    
-    df_consolidado = df_consolidado[orden_final]
-    
-    return df_consolidado
+# ── Guardar preservando instrucciones ─────────────────────────
 
-def generar_excel(df, nombre_archivo):
-    """Genera un archivo Excel con formato profesional"""
-    wb = Workbook()
+def guardar(df_resultado, bytes_p, columnas_plantilla, fila_header):
+    print("\n💾 Generando archivo…")
+    if isinstance(bytes_p, io.BytesIO):
+        bytes_p.seek(0)
+    
+    wb = load_workbook(bytes_p)
     ws = wb.active
-    ws.title = "Consolidado"
     
-    # Encabezados
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.value = col_name
-        cell.font = Font(bold=True, color='FFFFFF')
-        cell.fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
-        cell.alignment = Alignment(horizontal='center', vertical='center')
+    # Borrar filas antiguas (si hubiera)
+    if ws.max_row > fila_header:
+        ws.delete_rows(fila_header + 1, ws.max_row - fila_header)
     
-    # Datos
-    for row_idx, row_data in enumerate(df.values, start=2):
-        for col_idx, value in enumerate(row_data, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            cell.value = value
-            cell.alignment = Alignment(vertical='center')
+    # Escribir datos
+    for ri, (_, row_data) in enumerate(df_resultado.iterrows(), 1):
+        for ci, col in enumerate(columnas_plantilla, 1):
+            val = row_data.get(col)
+            cell_val = None if (pd.isna(val) or str(val).strip() in ("nan", "None", "")) else val
+            ws.cell(row=fila_header + ri, column=ci, value=cell_val)
     
-    # Ajustar anchos
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        max_length = max(len(str(col_name)), 12)
-        ws.column_dimensions[chr(64 + col_idx) if col_idx <= 26 else f"A{chr(64 + col_idx - 26)}"].width = max_length + 2
-    
-    # Guardar en BytesIO
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-    
-    return output
+    wb.save(OUTPUT_FILE)
+    print(f"✅ {OUTPUT_FILE}")
 
-# Configuración de la página
-st.set_page_config(
-    page_title="Consolidador de Remuneraciones 2025",
-    page_icon="📊",
-    layout="wide"
-)
+# ── Main ──────────────────────────────────────────────────────
 
-# Inicializar session_state
-if 'datos_empresas' not in st.session_state:
-    st.session_state.datos_empresas = []
-if 'empresas_agregadas' not in st.session_state:
-    st.session_state.empresas_agregadas = []
-
-# Título
-st.title("📊 Consolidador de Remuneraciones 2025")
-st.markdown("---")
-
-# Barra lateral
-with st.sidebar:
-    st.header("⚙️ Configuración")
+def main():
+    print("=" * 60)
+    print("  COMBINADOR DE REMUNERACIONES  v4 FINAL")
+    print("=" * 60)
     
-    rut_empresa = st.text_input("RUT Empresa para el Excel", placeholder="12345678-9")
-    mes_proceso = st.selectbox("Mes de Proceso", MESES_2025)
+    bytes_p, nombre_p, bytes_c, nombre_c = subir()
     
-    st.markdown("---")
-    st.markdown("### Empresas agregadas:")
-    if st.session_state.empresas_agregadas:
-        for empresa in st.session_state.empresas_agregadas:
-            st.success(f"✓ {empresa}")
+    df_resultado, columnas_plantilla, fila_header = combinar(bytes_p, nombre_p, bytes_c, nombre_c)
+    
+    if isinstance(bytes_p, io.BytesIO):
+        bytes_p.seek(0)
+    
+    guardar(df_resultado, bytes_p, columnas_plantilla, fila_header)
+    
+    print("\n📊 Vista previa (primeras 3 personas):")
+    cols_ver = ["Rut *", "Año_Mes (aaaamm) *", "Total Isapre *", "AFP *",
+                "Sueldo Base *", "Bono Calidad (H)", "Sobretiempo (H)"]
+    cols_ok = [c for c in cols_ver if c in df_resultado.columns]
+    print(df_resultado[cols_ok].head(3).to_string(index=False))
+    
+    if IN_COLAB:
+        print("\n⬇  Descargando…")
+        files.download(OUTPUT_FILE)
     else:
-        st.info("Ninguna empresa agregada aún")
+        print(f"\nArchivo: {Path(OUTPUT_FILE).resolve()}")
     
-    if st.button("🔄 Limpiar Todo", type="secondary"):
-        st.session_state.datos_empresas = []
-        st.session_state.empresas_agregadas = []
-        st.rerun()
+    print("\n🎉 ¡Proceso completado!")
 
-# Contenido principal
-col1, col2 = st.columns(2)
 
-with col1:
-    st.subheader("📄 Libro de Remuneraciones")
-    archivo_libro = st.file_uploader(
-        "Cargar Libro de Remuneraciones",
-        type=['xlsx', 'xls'],
-        key='libro'
-    )
-
-with col2:
-    st.subheader("📋 Informe de Haberes y Descuentos")
-    archivo_informe = st.file_uploader(
-        "Cargar Informe de Haberes y Descuentos",
-        type=['xlsx', 'xls'],
-        key='informe'
-    )
-
-st.markdown("---")
-
-# Botón para agregar empresa
-col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
-
-with col_btn1:
-    if st.button("➕ Agregar Empresa", type="primary", disabled=not (archivo_libro and archivo_informe and rut_empresa)):
-        try:
-            # Leer archivos
-            df_libro = pd.read_excel(archivo_libro)
-            df_informe = pd.read_excel(archivo_informe)
-            
-            # Procesar datos
-            df_libro_procesado = procesar_libro_remuneraciones(df_libro, rut_empresa)
-            df_informe_procesado = procesar_haberes_descuentos(df_informe)
-            
-            # Combinar por RUT
-            df_combinado = df_libro_procesado.copy()
-            
-            # Agregar columnas del informe
-            for col in df_informe_procesado.columns:
-                df_combinado[col] = df_informe_procesado[col]
-            
-            # Calcular Seguro Cesantía Empleador
-            valor_uf = UF_2025[mes_proceso]
-            df_combinado['Seguro Cesantía Empleador (D)'] = df_combinado.apply(
-                lambda row: calcular_seguro_cesantia_empleador(row, valor_uf),
-                axis=1
-            )
-            
-            # Agregar a session_state
-            st.session_state.datos_empresas.append(df_combinado)
-            
-            # Determinar nombre de empresa
-            if rut_empresa.startswith('96'):
-                nombre_empresa = "INGEMARS"
-            elif rut_empresa.startswith('90'):
-                nombre_empresa = "ENAP"
-            else:
-                nombre_empresa = f"Empresa {rut_empresa[:8]}"
-            
-            st.session_state.empresas_agregadas.append(nombre_empresa)
-            
-            st.success(f"✅ {nombre_empresa} agregada exitosamente!")
-            st.rerun()
-            
-        except Exception as e:
-            st.error(f"❌ Error al procesar los archivos: {str(e)}")
-
-with col_btn2:
-    if st.button("📥 Generar Excel", type="primary", disabled=len(st.session_state.datos_empresas) == 0):
-        try:
-            # Consolidar datos
-            df_final = consolidar_datos(st.session_state.datos_empresas, mes_proceso, 2025)
-            
-            if df_final is not None:
-                # Generar Excel
-                nombre_archivo = f"Consolidado_{mes_proceso}_2025.xlsx"
-                excel_buffer = generar_excel(df_final, nombre_archivo)
-                
-                st.download_button(
-                    label="⬇️ Descargar Excel Consolidado",
-                    data=excel_buffer,
-                    file_name=nombre_archivo,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-                st.success(f"✅ Excel generado: {nombre_archivo}")
-                
-                # Mostrar preview
-                with st.expander("👁️ Vista Previa de Datos"):
-                    st.dataframe(df_final.head(10), use_container_width=True)
-                    st.info(f"Total de registros: {len(df_final)}")
-            
-        except Exception as e:
-            st.error(f"❌ Error al generar el Excel: {str(e)}")
-
-# Información adicional
-with st.expander("ℹ️ Información del Sistema"):
-    st.markdown("""
-    ### Cómo usar:
-    1. **Configure** el RUT de la empresa y el mes de proceso en la barra lateral
-    2. **Cargue** el Libro de Remuneraciones y el Informe de Haberes y Descuentos
-    3. **Presione** "Agregar Empresa" para procesar y guardar los datos
-    4. **Repita** los pasos 1-3 para agregar más empresas al mismo mes
-    5. **Genere** el Excel consolidado con todas las empresas
-    
-    ### Cálculo Seguro Cesantía Empleador:
-    - **Contrato Indefinido**: 2.4% (si trabajador tiene Seguro Cesantía > 0)
-    - **Contrato Plazo Fijo/Obra**: 3.0% (si trabajador tiene Seguro Cesantía = 0)
-    - **Tope**: 131.8 UF del mes correspondiente
-    
-    ### Valores UF 2025:
-    """)
-    
-    col_uf1, col_uf2, col_uf3 = st.columns(3)
-    with col_uf1:
-        for mes in MESES_2025[:4]:
-            st.write(f"**{mes}**: ${UF_2025[mes]:,.2f}")
-    with col_uf2:
-        for mes in MESES_2025[4:8]:
-            st.write(f"**{mes}**: ${UF_2025[mes]:,.2f}")
-    with col_uf3:
-        for mes in MESES_2025[8:]:
-            st.write(f"**{mes}**: ${UF_2025[mes]:,.2f}")
+if __name__ == "__main__":
+    main()
