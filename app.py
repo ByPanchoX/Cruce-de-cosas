@@ -3,130 +3,129 @@ import pandas as pd
 import io
 import re
 
-# Configuración de página
-st.set_page_config(page_title="Consolidador Auditoría Final", layout="wide", page_icon="🏦")
+# Configuración de la App
+st.set_page_config(page_title="INGEMARS - Carga Talana Pro", page_icon="📈", layout="wide")
 
-# Datos 2025
-VALORES_UF_2025 = {"Enero": 38284.86, "Febrero": 38647.94, "Marzo": 38800.00, "Abril": 39050.00, "Mayo": 39200.00, "Junio": 39267.07, "Julio": 39179.01, "Agosto": 39383.07, "Septiembre": 39500.00, "Octubre": 39597.67, "Noviembre": 39643.59, "Diciembre": 39727.96}
+st.title("📈 Convertidor Histórico INGEMARS")
+st.markdown("Configura las tasas y la razón social para procesar tus libros de remuneraciones.")
 
-if 'db' not in st.session_state: st.session_state['db'] = []
+# --- BARRA LATERAL: CONFIGURACIÓN EDITABLE ---
+st.sidebar.header("⚙️ Configuración de Empresa")
 
-def clean_rut(rut):
-    if pd.isna(rut): return None
-    return "".join(filter(lambda x: x.isdigit() or x == 'K', str(rut).upper()))
+# Campo para Razón Social (editable)
+rs_input = st.sidebar.text_input("RUT Razón Social (Sin puntos y con guion)", value="76455680-1")
+# Limpieza de seguridad para la Razón Social
+rut_empresa = rs_input.replace(".", "").strip()
 
-def procesar_informe(df):
-    data = []
-    seccion, categoria = 'HABERES', None
-    for _, row in df.iterrows():
-        c0 = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ""
-        if 'HABERES' in c0.upper(): seccion = 'HABERES'
-        elif 'DESCUENTOS' in c0.upper(): seccion = 'DESCUENTOS'
-        if c0 and not c0.startswith('Total') and c0 not in ['Rut', 'Nombre', 'HABERES', 'DESCUENTOS']: categoria = c0
-        rut_r = str(row.iloc[2]) if pd.notna(row.iloc[2]) else ""
-        monto = row.iloc[10]
-        if '-' in rut_r and pd.notna(monto):
-            data.append({'RutKey': clean_rut(rut_r), 'Concepto': f"{categoria} ({'H' if seccion == 'HABERES' else 'D'})", 'Monto': monto})
-    if not data: return pd.DataFrame()
-    return pd.DataFrame(data).pivot_table(index='RutKey', columns='Concepto', values='Monto', aggfunc='sum').reset_index()
+st.sidebar.subheader("Tasa Mutual")
+tasa_mutual = st.sidebar.number_input("Mutual INGEMARS (%)", value=1.27, step=0.01) / 100
 
-st.title("📊 Auditoría de Remuneraciones 2025")
+st.sidebar.subheader("Tasas SIS Mensuales (%)")
+tasas_sis_input = {}
+meses_nombres = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+]
+# Valores por defecto proporcionados por Francisco
+defaults_sis = [1.38, 1.38, 1.38, 1.78, 1.78, 1.78, 1.88, 1.88, 1.88, 1.49, 1.49, 1.49]
 
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    mes_sel = st.selectbox("Mes de Proceso", list(VALORES_UF_2025.keys()))
-    rut_emp_global = st.text_input("RUT Empresa Principal", "76.455.680-1")
-    if st.button("🗑️ Borrar Memoria"):
-        st.session_state['db'] = []
-        st.rerun()
+for i, mes in enumerate(meses_nombres):
+    tasas_sis_input[i+1] = st.sidebar.number_input(f"SIS {mes}", value=defaults_sis[i], step=0.01) / 100
 
-entidad = st.selectbox("Origen de Datos:", ["INGEMARS", "ENAP", "Otro"])
-nombre_entidad = st.text_input("Especifique:") if entidad == "Otro" else entidad
+def limpieza_extrema(val):
+    if isinstance(val, str):
+        val = re.sub(r'[^\w\s\d.,\-_@\(\)/:;?¿!¡+*#=]', '', val)
+        val = "".join(c for c in val if c.isprintable())
+        return val.strip()
+    return val
 
-c1, c2, c3 = st.columns(3)
-with c1: f_lib = st.file_uploader("1. Libro de Remuneraciones", type=['xlsx'])
-with c2: f_inf = st.file_uploader("2. Informe Haberes/Descuentos", type=['xlsx'])
-with c3: f_pat = st.file_uploader("3. Aporte Patronal (Requerido para Accidentes/SIS)", type=['xlsx'])
+# --- INTERFAZ DE CARGA ---
+col1, col2 = st.columns(2)
+with col1:
+    template_file = st.file_uploader("1. Sube la Plantilla de Talana (Excel o CSV)", type=["xlsx", "csv"])
+with col2:
+    libros_files = st.file_uploader("2. Sube los Libros de Remuneraciones", type=["xlsx", "csv"], accept_multiple_files=True)
 
-if st.button(f"➕ Procesar {nombre_entidad}", type="primary"):
-    if f_lib or f_inf or f_pat:
-        try:
-            # 1. LIBRO
-            df_lib = pd.DataFrame()
-            if f_lib:
-                raw_lib = pd.read_excel(f_lib)
-                dias = [c for c in raw_lib.columns if re.search(r'^[Nn][°º\.\s]', str(c))]
-                df_lib = raw_lib[['Rut Trabajador', 'Apellido Paterno', 'Apellido Materno', 'Nombres'] + dias].copy()
-                df_lib['Total Imponible (H)'] = raw_lib.get('Imponible', 0)
-                df_lib['RutKey'] = df_lib['Rut Trabajador'].apply(clean_rut)
-
-            # 2. INFORME
-            df_inf_pivot = procesar_informe(pd.read_excel(f_inf)) if f_inf else pd.DataFrame()
+if template_file and libros_files:
+    try:
+        if template_file.name.endswith('.csv'):
+            df_struct = pd.read_csv(template_file, skiprows=2, sep=None, engine='python', encoding='latin-1', on_bad_lines='skip')
+        else:
+            df_struct = pd.read_excel(template_file, skiprows=2)
             
-            # 3. APORTE PATRONAL (Mapeo de nombres exactos solicitados)
-            df_pat_clean = pd.DataFrame()
-            if f_pat:
-                pat_raw = pd.read_excel(f_pat)
-                pat_raw['RutKey'] = pat_raw['Rut Trabajador'].apply(clean_rut)
-                mapeo = {
-                    'Aporte Accidentes de Trabajo IPS': 'Aporte Accidentes de Trabajo IPS (P)',
-                    'Aporte Accidentes de Trabajo Mutual': 'Aporte Accidentes de Trabajo Mutual (P)',
-                    'Adicional de Capitalización Individual AFP': 'Adicional de Capitalización Individual AFP (P)',
-                    'Expectativa de Vida Seguro Social': 'Expectativa de Vida Seguro Social (P)',
-                    'Seguro de Cesantía Empleador': 'Seguro de Cesantía Empleador (P)',
-                    'Seguro de Invalidez y Sobrevivencia Empleador': 'Seguro de Invalidez y Sobrevivencia Empleador (P)',
-                    'Cargo': 'Cargo', 'Centro de Costo': 'Centro de Costo', 'Tipo de Contrato': 'Tipo de Contrato'
+        cols_oficiales = [c.strip() for c in df_struct.columns.tolist() if "Unnamed" not in c]
+        lista_meses = []
+
+        with st.form("procesar_ingemars"):
+            dict_p = {}
+            for f in libros_files:
+                c1, c2 = st.columns([3, 1])
+                c1.write(f"📄 {f.name}")
+                default_p = "202501"
+                match = re.search(r'(\d{2})-(\d{4})', f.name)
+                if match: default_p = f"{match.group(2)}{match.group(1)}"
+                dict_p[f.name] = c2.text_input("Periodo (AAAAMM)", value=default_p, key=f.name)
+            
+            submit = st.form_submit_button("🚀 Procesar y Consolidar")
+
+        if submit:
+            for f in libros_files:
+                periodo = dict_p[f.name]
+                mes_num = int(str(periodo)[4:])
+                tasa_sis_actual = tasas_sis_input.get(mes_num, 0.0149)
+                
+                df_l = pd.read_csv(f, sep=None, engine='python', encoding='latin-1') if f.name.endswith('.csv') else pd.read_excel(f)
+                df_l.columns = [c.strip() for c in df_l.columns]
+                
+                df_mes = pd.DataFrame(0, index=df_l.index, columns=cols_oficiales)
+                
+                # Mapeo base con RUT de empresa editable
+                df_mes['Rut *'] = df_l['Rut Trabajador'].astype(str).str.replace(".", "")
+                df_mes['Rut Razón Social *'] = rut_empresa
+                df_mes['Año_Mes (aaaamm) *'] = periodo
+                
+                map_cols = {
+                    'Sueldo Base *': 'Sueldo Base',
+                    'Remuneración Imponible *': 'Imponible',
+                    'Remuneración Total o Sueldo Bruto *': 'Total Haberes',
+                    'Sueldo Liquido *': 'Líquido',
+                    'AFP *': 'Prevision',
+                    'Seguro Cesantía Trabajador *': 'Seguro de Cesantía',
+                    'Días Trabajados del Mes *': 'N° Dias Trabajados',
+                    'Mensual *': 'Gratificacion'
                 }
-                cols_ok = [c for c in mapeo.keys() if c in pat_raw.columns]
-                df_pat_clean = pat_raw[['RutKey'] + cols_ok].rename(columns=mapeo)
 
-            # --- UNIÓN ---
-            df_curr = df_lib if not df_lib.empty else (df_pat_clean if not df_pat_clean.empty else df_inf_pivot)
-            if not df_lib.empty and not df_inf_pivot.empty:
-                df_curr = pd.merge(df_curr, df_inf_pivot, on='RutKey', how='outer')
-            if not df_pat_clean.empty and df_curr is not df_pat_clean:
-                df_curr = pd.merge(df_curr, df_pat_clean, on='RutKey', how='outer', suffixes=('', '_tecnico'))
+                for tal, lib in map_cols.items():
+                    if lib in df_l.columns:
+                        df_mes[tal] = pd.to_numeric(df_l[lib], errors='coerce').fillna(0)
 
-            # Insertar cabeceras fijas
-            df_curr['RUT EMPRESA'] = rut_emp_global
-            df_curr['MES'] = mes_sel
-            df_curr['AÑO'] = 2025
+                df_mes['Total Isapre *'] = pd.to_numeric(df_l['Salud'], errors='coerce').fillna(0) + pd.to_numeric(df_l.get('Diferencia Plan de Salud', 0), errors='coerce').fillna(0)
+                
+                # Aportes Patronales
+                imp = df_mes['Remuneración Imponible *']
+                df_mes['Seguro Invalidez y Supervivencia (SIS) *'] = (imp * tasa_sis_actual).round(0)
+                df_mes['Seguro Accidente de Trabajo *'] = (imp * tasa_mutual).round(0)
+                
+                # Lógica Seguro Cesantía (2.4% vs 3.0%)
+                df_mes['Seguro Cesantía Empleador *'] = df_mes['Seguro Cesantía Trabajador *'].apply(lambda x: 0.024 if x > 0 else 0.030)
+                df_mes['Seguro Cesantía Empleador *'] = (imp * df_mes['Seguro Cesantía Empleador *']).round(0)
+
+                lista_meses.append(df_mes)
+
+            df_final = pd.concat(lista_meses, ignore_index=True)
+            df_final = df_final[cols_oficiales].applymap(limpieza_extrema)
             
-            st.session_state['db'].append(df_curr)
-            st.success(f"✅ {nombre_entidad} agregada.")
-        except Exception as e:
-            st.error(f"Error: {e}")
+            for c in df_final.columns:
+                if '*' in c and 'Rut' not in c and 'Año_Mes' not in c:
+                    df_final[c] = pd.to_numeric(df_final[c]).astype(int)
 
-# --- GENERACIÓN FINAL (LIMPIEZA TOTAL) ---
-if st.session_state['db']:
-    st.divider()
-    if st.button("🚀 GENERAR EXCEL FINAL", use_container_width=True):
-        df_all = pd.concat(st.session_state['db'], ignore_index=True)
-        df_final = df_all.groupby('RutKey').first().reset_index()
-        
-        # DEFINICIÓN DE COLUMNAS A MANTENER (Elimina todo lo demás)
-        orden_id = ['RUT EMPRESA', 'MES', 'AÑO', 'Rut Trabajador']
-        orden_personal = ['Apellido Paterno', 'Apellido Materno', 'Nombres', 'Cargo', 'Centro de Costo', 'Tipo de Contrato']
-        
-        # Identificar grupos por patrones
-        cols_dias = [c for c in df_final.columns if re.search(r'^[Nn][°º\.\s]', str(c))]
-        cols_hab = sorted([c for c in df_final.columns if '(H)' in c])
-        cols_des = sorted([c for c in df_final.columns if '(D)' in c])
-        cols_pat = sorted([c for c in df_final.columns if '(P)' in c])
-        
-        # CREAR LISTA DE COLUMNAS FINAL (Solo las permitidas)
-        final_allowed_cols = []
-        for c in orden_id + orden_personal + cols_dias + cols_hab + cols_des + cols_pat:
-            if c in df_final.columns and c not in final_allowed_cols:
-                final_allowed_cols.append(c)
-        
-        # FILTRO POSITIVO: Solo se queda lo que está en la lista final_allowed_cols
-        df_final = df_final[final_allowed_cols]
-        
-        # Exportar
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_final.to_excel(writer, index=False)
-        
-        st.download_button("📥 DESCARGAR REPORTE LIMPIO", output.getvalue(), f"Consolidado_Final_{mes_sel}.xlsx")
-        st.dataframe(df_final)
+            st.success(f"✅ ¡Procesado para {rut_empresa}!")
+            
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df_final.to_excel(writer, index=False)
+            
+            st.download_button("⬇️ Descargar Carga Histórica", output.getvalue(), "Carga_Masiva_INGEMARS.xlsx")
+
+    except Exception as e:
+        st.error(f"Error: {e}")
